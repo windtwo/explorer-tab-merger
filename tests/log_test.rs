@@ -19,23 +19,29 @@ fn writes_and_rotates_at_64kb() {
     let dir = scratch_dir("rot1");
     let path = dir.join("error.log");
 
+    // Seed and bloat the file past the 64 KB threshold. Rotation is checked BEFORE each
+    // write, so this big write itself does not rotate (file is still tiny at check time);
+    // the *next* write does.
     etm_log::write_to(&path, "hello").unwrap();
-    let contents = fs::read_to_string(&path).unwrap();
-    assert!(contents.contains("hello"));
-
-    // Write enough to push past the 64 KB rotation threshold.
     let big = "x".repeat(80_000);
     etm_log::write_to(&path, &big).unwrap();
 
+    // Sanity: still no rotation yet (file just crossed the threshold from this side).
     let old = dir.join("error.log.old");
-    assert!(old.exists(), "rotated file should exist");
+    assert!(!old.exists(), "no rotation before the trigger write");
 
+    // Trigger: any further write notices file >= 64 KB and rotates first.
+    etm_log::write_to(&path, "after-rotate").unwrap();
+
+    assert!(old.exists(), "rotated file should now exist");
     let new = fs::read_to_string(&path).unwrap();
-    assert!(new.contains("xxxxx"));
+    assert!(new.contains("after-rotate"));
     assert!(
         !new.contains("hello"),
-        "after rotation, original content must live in .old, not main"
+        "post-rotation, original content lives only in .old"
     );
+    let old_contents = fs::read_to_string(&old).unwrap();
+    assert!(old_contents.contains("hello"));
 }
 
 #[test]
