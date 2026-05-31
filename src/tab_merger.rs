@@ -75,7 +75,7 @@ fn try_merge(shell_windows: &IShellWindows, new_window: &IDispatch) -> WinResult
     unsafe {
         let url_var = VARIANT::from(location_bstr);
         new_tab_wb.Navigate2(
-            Some(&url_var as *const VARIANT),
+            &url_var as *const VARIANT,
             None,
             None,
             None,
