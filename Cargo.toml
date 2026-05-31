@@ -1,0 +1,37 @@
+[package]
+name = "explorer_tab_merger"
+version = "0.1.0"
+edition = "2021"
+description = "Auto-merge new File Explorer windows into tabs (minimal, no-UI)"
+publish = false
+
+[lib]
+name = "explorer_tab_merger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "explorer_tab_merger"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_Globalization",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
