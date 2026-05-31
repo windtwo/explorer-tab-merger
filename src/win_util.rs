@@ -4,8 +4,11 @@
 //! All public functions in this module are safe wrappers; unsafe blocks are confined to the
 //! actual Win32 call site.
 
+use std::ffi::c_void;
+
 use windows::core::{Error, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, IsWindow, PostMessageW,
     SetForegroundWindow, ShowWindow, GA_ROOT, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
@@ -111,6 +114,29 @@ pub fn request_new_tab(host: HWND) -> Result<(), Error> {
         PostMessageW(tab, WM_COMMAND, WPARAM(CMD_NEW_TAB as usize), LPARAM(0))?;
     }
     Ok(())
+}
+
+/// Hide the window from the DWM compositor (DWMWA_CLOAK = 1). The window still receives
+/// messages, paints, and is owned by its process — but the user can't see it. This is the
+/// same mechanism Explorer uses internally for inactive tabs. Cheap (~ microseconds).
+pub fn cloak(hwnd: HWND) {
+    set_cloak(hwnd, 1);
+}
+
+/// Reverse of [`cloak`].
+pub fn uncloak(hwnd: HWND) {
+    set_cloak(hwnd, 0);
+}
+
+fn set_cloak(hwnd: HWND, value: u32) {
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &value as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
 }
 
 pub fn close_window(hwnd: HWND) {

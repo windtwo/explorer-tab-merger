@@ -33,23 +33,32 @@ pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
     if class != win_util::CABINET_WCLASS {
         return; // not File Explorer — silently ignore (very frequent path)
     }
-    if let Err(e) = try_merge(shell_windows, hwnd) {
+
+    // Existing top-level window being re-shown (un-minimised, focus change after we already
+    // gave it a tab from a previous merge) → leave alone, do NOT cloak.
+    if win_util::find_tab_handles(hwnd).len() > 1 {
+        return;
+    }
+
+    // No other Explorer window to merge into — first window of the session, etc. Let it
+    // live as a normal visible window.
+    let host = match win_util::select_host(hwnd) {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Single-tab CabinetWClass with a real host candidate → merge it.
+    // CLOAK before the user can perceive a flash. If merge fails we uncloak to give the
+    // window back; on success, new_wb.Quit() destroys the (still-cloaked) window so the
+    // user never sees it at all.
+    win_util::cloak(hwnd);
+    if let Err(e) = try_merge(shell_windows, hwnd, host) {
         log::write(&format!("merge failed for {:?}: {:?}", hwnd.0, e));
+        win_util::uncloak(hwnd);
     }
 }
 
-fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
-    // Existing window (un-minimised or a tab landing here from us) → leave alone.
-    let tab_count = win_util::find_tab_handles(new_top).len();
-    if tab_count > 1 {
-        return Ok(());
-    }
-
-    let host = match win_util::select_host(new_top) {
-        Some(h) => h,
-        None => return Ok(()), // no host: let new window live
-    };
-
+fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinResult<()> {
     // Need the new top-level's IWebBrowser2 to read its URL.
     let new_wb = match wait_for_wb_for_top_level(shell_windows, new_top) {
         Some(wb) => wb,
