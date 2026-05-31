@@ -4,14 +4,13 @@
 //! All public functions in this module are safe wrappers; unsafe blocks are confined to the
 //! actual Win32 call site.
 
-use std::ffi::c_void;
-
 use windows::core::{Error, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, IsWindow, PostMessageW,
-    SetForegroundWindow, ShowWindow, GA_ROOT, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, IsWindow,
+    PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    WS_EX_LAYERED,
 };
 
 /// File Explorer's top-level window class.
@@ -116,34 +115,31 @@ pub fn request_new_tab(host: HWND) -> Result<(), Error> {
     Ok(())
 }
 
-/// Maximum-suppression hide: DWM cloak + `ShowWindow(SW_HIDE)`. The cloak hides the
-/// window from the compositor; SW_HIDE clears `WS_VISIBLE`, preventing further paints
-/// at the source. Using both is belt-and-braces — `WINEVENT_OUTOFCONTEXT` callbacks are
-/// asynchronous, so the window may have leaked one frame before we run, but everything
-/// after that is suppressed by both layers.
+/// Hide the window by making it a layered window with alpha=0 (fully transparent).
+/// This is the same mechanism the original w4po project uses (see Helper.HideWindow,
+/// non-keepTheme branch).
+///
+/// Why not DWM cloak? Cloak only tells the compositor "don't composite next frame", but
+/// Win11 paints the window-open animation BEFORE the compositor stage — so cloak misses
+/// the first visible frame. WS_EX_LAYERED + alpha=0 is enforced at the GDI level for
+/// every painted pixel, including animation frames, so the window is invisible from the
+/// moment the style is applied.
 pub fn cloak(hwnd: HWND) {
-    set_cloak(hwnd, 1);
     unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered_bit = WS_EX_LAYERED.0 as isize;
+        if exstyle & layered_bit == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle | layered_bit);
+        }
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
     }
 }
 
-/// Reverse of [`cloak`].
+/// Reverse of [`cloak`] — set alpha back to 255 (fully opaque). We leave WS_EX_LAYERED on
+/// the window; removing it is unnecessary and a touch risky (race with paint).
 pub fn uncloak(hwnd: HWND) {
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-    }
-    set_cloak(hwnd, 0);
-}
-
-fn set_cloak(hwnd: HWND, value: u32) {
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAK,
-            &value as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     }
 }
 
