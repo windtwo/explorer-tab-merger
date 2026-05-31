@@ -17,12 +17,12 @@ use crate::log;
 use crate::win_util;
 
 const WAIT_NEW_TAB_TIMEOUT_MS: u64 = 2_000;
-const WAIT_NEW_TAB_POLL_MS: u64 = 25;
+const WAIT_NEW_TAB_POLL_MS: u64 = 5;
 
 /// How long to wait for IShellWindows to register the new tab. Win11 has been observed
 /// taking up to a few seconds.
 const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
-const WAIT_WB_POLL_MS: u64 = 25;
+const WAIT_WB_POLL_MS: u64 = 5;
 
 /// Called on `EVENT_OBJECT_CREATE`. Fires before the window's first paint, so cloaking
 /// here actually prevents the visible flash. Any cloak applied is "speculative" — if
@@ -167,16 +167,24 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
 
 /// Wait until host's IShellWindows entry count exceeds `base_count`, then return the
 /// most-recently-added matching entry.
+///
+/// Hot loop: probe `Count()` (1 COM call) every poll; only run the O(N) host-match
+/// iteration when the total entry count has actually changed. Without this, polling at
+/// 5 ms × ~5 entries × ~3 COM calls per entry = sustained noticeable CPU during the wait.
 fn wait_for_new_host_entry(
     shell_windows: &IShellWindows,
     host: HWND,
     base_count: usize,
 ) -> Option<IWebBrowser2> {
+    let mut last_total = unsafe { shell_windows.Count() }.unwrap_or(-1);
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
-        let current = count_entries_for_top(shell_windows, host);
-        if current > base_count {
-            return find_last_wb_for_top(shell_windows, host);
+        let current_total = unsafe { shell_windows.Count() }.unwrap_or(-1);
+        if current_total != last_total {
+            last_total = current_total;
+            if count_entries_for_top(shell_windows, host) > base_count {
+                return find_last_wb_for_top(shell_windows, host);
+            }
         }
         sleep(Duration::from_millis(WAIT_WB_POLL_MS));
     }
