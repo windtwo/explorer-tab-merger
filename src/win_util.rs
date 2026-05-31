@@ -11,7 +11,7 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, IsWindow, PostMessageW,
-    SetForegroundWindow, ShowWindow, GA_ROOT, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    SetForegroundWindow, ShowWindow, GA_ROOT, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
 };
 
 /// File Explorer's top-level window class.
@@ -116,15 +116,23 @@ pub fn request_new_tab(host: HWND) -> Result<(), Error> {
     Ok(())
 }
 
-/// Hide the window from the DWM compositor (DWMWA_CLOAK = 1). The window still receives
-/// messages, paints, and is owned by its process — but the user can't see it. This is the
-/// same mechanism Explorer uses internally for inactive tabs. Cheap (~ microseconds).
+/// Maximum-suppression hide: DWM cloak + `ShowWindow(SW_HIDE)`. The cloak hides the
+/// window from the compositor; SW_HIDE clears `WS_VISIBLE`, preventing further paints
+/// at the source. Using both is belt-and-braces — `WINEVENT_OUTOFCONTEXT` callbacks are
+/// asynchronous, so the window may have leaked one frame before we run, but everything
+/// after that is suppressed by both layers.
 pub fn cloak(hwnd: HWND) {
     set_cloak(hwnd, 1);
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
 }
 
 /// Reverse of [`cloak`].
 pub fn uncloak(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    }
     set_cloak(hwnd, 0);
 }
 
