@@ -7,8 +7,8 @@
 use windows::core::{Error, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetClassNameW, IsWindow, PostMessageW, SetForegroundWindow,
-    ShowWindow, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, IsWindow, PostMessageW,
+    SetForegroundWindow, ShowWindow, GA_ROOT, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
 };
 
 /// File Explorer's top-level window class.
@@ -56,6 +56,17 @@ pub fn get_window_class(hwnd: HWND) -> Option<String> {
 
 pub fn is_explorer(hwnd: HWND) -> bool {
     get_window_class(hwnd).as_deref() == Some(CABINET_WCLASS)
+}
+
+/// Walk up to the top-level (GA_ROOT) ancestor. Returns the input unchanged if it has
+/// no ancestor.
+pub fn top_level_window(hwnd: HWND) -> HWND {
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if root.0.is_null() {
+        hwnd
+    } else {
+        root
+    }
 }
 
 /// Return every `ShellTabWindowClass` child of the given host, in enumeration order.

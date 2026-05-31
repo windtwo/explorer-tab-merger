@@ -25,22 +25,45 @@ pub fn on_new_window(shell_windows: &IShellWindows, new_window: IDispatch) {
 }
 
 fn try_merge(shell_windows: &IShellWindows, new_window: &IDispatch) -> WinResult<()> {
-    // The IDispatch we're handed represents the newly-registered shell window. Cast to
-    // IWebBrowser2 to access its HWND and target URL.
+    // The IDispatch we're handed represents the newly-registered shell window. In
+    // Windows 11 this is the per-tab IShellBrowser, NOT the top-level window — so
+    // IWebBrowser2::HWND returns the ShellTabWindowClass child HWND. We walk up to the
+    // CabinetWClass top-level via GetAncestor(GA_ROOT) to decide what to do.
     let new_wb: IWebBrowser2 = new_window.cast()?;
 
-    let new_hwnd_raw = unsafe { new_wb.HWND()?.0 };
-    let new_hwnd = HWND(new_hwnd_raw as *mut std::ffi::c_void);
+    let tab_hwnd_raw = unsafe { new_wb.HWND()?.0 };
+    let tab_hwnd = HWND(tab_hwnd_raw as *mut std::ffi::c_void);
+    let top = win_util::top_level_window(tab_hwnd);
+    let class = win_util::get_window_class(top).unwrap_or_default();
+    let tab_count_in_top = win_util::find_tab_handles(top).len();
 
-    if !win_util::is_explorer(new_hwnd) {
-        // Could be IE-derived, Control Panel, etc. Leave it alone.
+    log::write(&format!(
+        "event: tab_hwnd={:?} top={:?} class={:?} tabs_in_top={}",
+        tab_hwnd.0, top.0, class, tab_count_in_top
+    ));
+
+    if class != win_util::CABINET_WCLASS {
+        // Not File Explorer (could be IE-derived, Control Panel, etc.).
         return Ok(());
     }
 
-    let host = match win_util::select_host(new_hwnd) {
+    // If the top-level window already has more than one tab, this event was triggered by
+    // a tab being added to an EXISTING window — most likely by our own WM_COMMAND from a
+    // previous merge call. Skipping prevents infinite loops.
+    if tab_count_in_top > 1 {
+        log::write("skip: top-level already has multiple tabs (likely our own merge)");
+        return Ok(());
+    }
+
+    let host = match win_util::select_host(top) {
         Some(h) => h,
-        None => return Ok(()), // no host: new window lives on its own
+        None => {
+            log::write("skip: no host candidate, letting new window live");
+            return Ok(());
+        }
     };
+
+    log::write(&format!("merging into host={:?}", host.0));
 
     let tabs_before: Vec<HWND> = win_util::find_tab_handles(host);
 
