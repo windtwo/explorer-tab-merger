@@ -1,8 +1,8 @@
 //! IDispatch sink for `DShellWindowsEvents::WindowRegistered`.
 //!
 //! We implement the bare minimum of `IDispatch` (only `Invoke` does real work; the rest
-//! return E_NOTIMPL — that's fine because the connection-point machinery never asks for
-//! type info on a pure event sink) and attach it via the standard ConnectionPoint protocol.
+//! return E_NOTIMPL — fine because the connection-point machinery never asks for type info
+//! on a pure event sink) and attach it via the standard ConnectionPoint protocol.
 //!
 //! Well-known IIDs/DISPIDs (from `shldisp.h`):
 //! - `DIID_DShellWindowsEvents` = {FE4106E0-399A-11D0-A48C-00A0C90A8F39}
@@ -11,13 +11,12 @@
 
 use std::rc::Rc;
 
-use windows::core::{implement, Interface, Result as WinResult, GUID, PCWSTR};
+use windows::core::{implement, Interface, Result as WinResult, GUID, PCWSTR, VARIANT};
 use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::System::Com::{
     IConnectionPoint, IConnectionPointContainer, IDispatch, IDispatch_Impl, ITypeInfo,
     DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO,
 };
-use windows::Win32::System::Variant::{VARIANT, VT_I2, VT_I4, VT_INT};
 use windows::Win32::UI::Shell::IShellWindows;
 
 const DIID_DSHELL_WINDOWS_EVENTS: GUID =
@@ -73,39 +72,19 @@ impl IDispatch_Impl for WindowRegisteredSink_Impl {
         }
 
         // The cookie is a LONG packed as a VARIANT, arg index 0.
-        let cookie_variant = unsafe { &*params.rgvarg };
-        let cookie = match unsafe { variant_to_i32(cookie_variant) } {
-            Some(c) => c,
-            None => return Ok(()),
+        let cookie_variant: &VARIANT = unsafe { &*params.rgvarg };
+        let cookie: i32 = match i32::try_from(cookie_variant) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
         };
 
         // Look the new window up. Race: it may have been revoked already — that's fine.
-        let cookie_var = variant_from_i32(cookie);
-        if let Ok(dispatch) = unsafe { self.shell_windows.Item(cookie_var) } {
+        let cookie_var = VARIANT::from(cookie);
+        if let Ok(dispatch) = unsafe { self.shell_windows.Item(&cookie_var) } {
             (self.callback)(dispatch);
         }
         Ok(())
     }
-}
-
-unsafe fn variant_to_i32(v: &VARIANT) -> Option<i32> {
-    let vt = v.Anonymous.Anonymous.vt;
-    if vt == VT_I4 || vt == VT_INT {
-        Some(v.Anonymous.Anonymous.Anonymous.lVal)
-    } else if vt == VT_I2 {
-        Some(v.Anonymous.Anonymous.Anonymous.iVal as i32)
-    } else {
-        None
-    }
-}
-
-fn variant_from_i32(value: i32) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        v.Anonymous.Anonymous.vt = VT_I4;
-        v.Anonymous.Anonymous.Anonymous.lVal = value;
-    }
-    v
 }
 
 /// Advise the IShellWindows event source. The returned [`Subscription`] holds the connection;

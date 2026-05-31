@@ -14,8 +14,12 @@ name = "explorer_tab_merger"
 path = "src/main.rs"
 
 [dependencies]
+# windows-core is needed as a direct dep because the #[implement] proc-macro generates
+# code that references `::windows_core::...` paths.
+windows-core = "0.58"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",                  # for SECURITY_ATTRIBUTES (required by RegCreateKeyExW, CreateMutexW)
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Variant",
@@ -27,6 +31,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
     "Win32_Globalization",
+    "implement",                       # enables #[implement] macro + _Impl traits
 ] }
 
 [profile.release]

@@ -6,10 +6,9 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, Result as WinResult, BSTR};
+use windows::core::{Interface, Result as WinResult, BSTR, VARIANT};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::Win32::System::Com::IDispatch;
-use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
 
 use crate::log;
@@ -30,8 +29,8 @@ fn try_merge(shell_windows: &IShellWindows, new_window: &IDispatch) -> WinResult
     // IWebBrowser2 to access its HWND and target URL.
     let new_wb: IWebBrowser2 = new_window.cast()?;
 
-    let new_hwnd_isize = unsafe { new_wb.HWND()?.0 as isize };
-    let new_hwnd = HWND(new_hwnd_isize as *mut std::ffi::c_void);
+    let new_hwnd_raw = unsafe { new_wb.HWND()?.0 };
+    let new_hwnd = HWND(new_hwnd_raw as *mut std::ffi::c_void);
 
     if !win_util::is_explorer(new_hwnd) {
         // Could be IE-derived, Control Panel, etc. Leave it alone.
@@ -70,21 +69,12 @@ fn try_merge(shell_windows: &IShellWindows, new_window: &IDispatch) -> WinResult
         }
     };
 
-    // Navigate the freshly-created tab to the URL. Navigate2 takes one `*mut VARIANT` for
-    // the URL plus four optional `*mut VARIANT` params (flags/target/postdata/headers); we
-    // only set the URL.
+    // Navigate the freshly-created tab to the URL. Navigate2 takes one VARIANT for URL plus
+    // four optional VARIANTs (flags/target/postdata/headers); we only set the URL.
     unsafe {
-        let url_var = bstr_to_variant(&location_bstr);
-        let empty = VARIANT::default();
-        let url_ptr: *const VARIANT = &url_var;
-        let empty_ptr: *const VARIANT = &empty;
-        new_tab_wb.Navigate2(
-            url_ptr as *mut VARIANT,
-            empty_ptr as *mut VARIANT,
-            empty_ptr as *mut VARIANT,
-            empty_ptr as *mut VARIANT,
-            empty_ptr as *mut VARIANT,
-        )?;
+        let url_var = VARIANT::from(location_bstr);
+        let empty = VARIANT::new();
+        new_tab_wb.Navigate2(&url_var, &empty, &empty, &empty, &empty)?;
     }
 
     // Dispose of the original spawned window. Quit() is the COM-clean route.
@@ -115,8 +105,8 @@ fn wait_for_new_tab(host: HWND, before: &[HWND]) -> Option<HWND> {
 fn find_wb_for_tab(shell_windows: &IShellWindows, tab_hwnd: HWND) -> Option<IWebBrowser2> {
     let count = unsafe { shell_windows.Count().ok()? };
     for i in 0..count {
-        let idx_var = variant_from_i32(i);
-        let disp = match unsafe { shell_windows.Item(idx_var) } {
+        let idx_var = VARIANT::from(i);
+        let disp = match unsafe { shell_windows.Item(&idx_var) } {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -124,34 +114,14 @@ fn find_wb_for_tab(shell_windows: &IShellWindows, tab_hwnd: HWND) -> Option<IWeb
             Ok(w) => w,
             Err(_) => continue,
         };
-        let h_isize = match unsafe { wb.HWND() } {
-            Ok(h) => h.0 as isize,
+        let h_raw = match unsafe { wb.HWND() } {
+            Ok(h) => h.0,
             Err(_) => continue,
         };
-        let hwnd = HWND(h_isize as *mut std::ffi::c_void);
+        let hwnd = HWND(h_raw as *mut std::ffi::c_void);
         if hwnd.0 == tab_hwnd.0 {
             return Some(wb);
         }
     }
     None
-}
-
-fn variant_from_i32(value: i32) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        v.Anonymous.Anonymous.vt = VT_I4;
-        v.Anonymous.Anonymous.Anonymous.lVal = value;
-    }
-    v
-}
-
-unsafe fn bstr_to_variant(s: &BSTR) -> VARIANT {
-    use windows::Win32::System::Variant::VT_BSTR;
-    let mut v = VARIANT::default();
-    v.Anonymous.Anonymous.vt = VT_BSTR;
-    // ManuallyDrop ownership: the VARIANT owns the BSTR for the duration of the call. We
-    // clone to keep the original alive separately.
-    let clone = s.clone();
-    v.Anonymous.Anonymous.Anonymous.bstrVal = std::mem::ManuallyDrop::new(clone);
-    v
 }
