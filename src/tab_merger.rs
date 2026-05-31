@@ -94,20 +94,28 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
     // Read target URL from the original window before we destroy it.
     let location_bstr: BSTR = unsafe { new_wb.LocationURL()? };
     log::write(&format!("location = {:?}", location_bstr.to_string()));
+    let _ = new_tab; // we navigate via the host's WB; the new_tab HWND is just our "WM_COMMAND succeeded" signal
 
-    let new_tab_wb = match wait_for_wb_for_tab(shell_windows, new_tab) {
+    // Navigation strategy: in Windows 11, each Explorer top-level window appears to expose
+    // a SINGLE IShellBrowser through IShellWindows — representing the currently-active tab,
+    // not per-tab entries. Since WM_COMMAND 0xA21B not only creates a new tab but also
+    // makes it active, we can find the HOST's IWebBrowser2 and Navigate2 on it; the
+    // navigation lands in the new tab.
+    log_shell_windows_snapshot(shell_windows, "before navigate");
+
+    let nav_wb = match wait_for_wb_for_top_level(shell_windows, host) {
         Some(wb) => wb,
         None => {
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "could not locate new tab IWebBrowser2",
+                "could not locate host's IWebBrowser2",
             ));
         }
     };
 
     unsafe {
         let url_var = VARIANT::from(location_bstr);
-        new_tab_wb.Navigate2(
+        nav_wb.Navigate2(
             &url_var as *const VARIANT,
             None,
             None,
@@ -152,18 +160,40 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
     None
 }
 
-fn wait_for_wb_for_tab(shell_windows: &IShellWindows, tab: HWND) -> Option<IWebBrowser2> {
-    let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
-    while Instant::now() < deadline {
-        // Each IWebBrowser2 represents a tab; the HWND returned by its HWND() is the
-        // ShellTabWindowClass child. So we match the tab HWND directly here, not its
-        // top-level ancestor.
-        if let Some(wb) = find_wb_matching_tab(shell_windows, tab) {
-            return Some(wb);
+/// Dump the IShellWindows collection contents to the log — useful for diagnosing why a
+/// merge can't find the IWebBrowser2 it expects.
+fn log_shell_windows_snapshot(shell_windows: &IShellWindows, label: &str) {
+    let count = match unsafe { shell_windows.Count() } {
+        Ok(c) => c,
+        Err(e) => {
+            log::write(&format!("snapshot[{}]: Count failed: {:?}", label, e));
+            return;
         }
-        sleep(Duration::from_millis(WAIT_WB_POLL_MS));
+    };
+    log::write(&format!("snapshot[{}]: count={}", label, count));
+    for i in 0..count {
+        let idx_var = VARIANT::from(i);
+        let entry_desc = match unsafe { shell_windows.Item(&idx_var) } {
+            Ok(disp) => match disp.cast::<IWebBrowser2>() {
+                Ok(wb) => match unsafe { wb.HWND() } {
+                    Ok(h) => {
+                        let hwnd = HWND(h.0 as *mut std::ffi::c_void);
+                        let top = win_util::top_level_window(hwnd);
+                        let class = win_util::get_window_class(hwnd).unwrap_or_default();
+                        let top_class = win_util::get_window_class(top).unwrap_or_default();
+                        format!(
+                            "wb hwnd={:?}({}) top={:?}({})",
+                            hwnd.0, class, top.0, top_class
+                        )
+                    }
+                    Err(e) => format!("wb (HWND err: {:?})", e),
+                },
+                Err(_) => "(not IWebBrowser2)".to_string(),
+            },
+            Err(e) => format!("Item({}) err: {:?}", i, e),
+        };
+        log::write(&format!("  [{}] {}", i, entry_desc));
     }
-    None
 }
 
 fn find_wb_matching(
@@ -194,26 +224,3 @@ fn find_wb_matching(
     None
 }
 
-fn find_wb_matching_tab(shell_windows: &IShellWindows, tab: HWND) -> Option<IWebBrowser2> {
-    let count = unsafe { shell_windows.Count().ok()? };
-    for i in 0..count {
-        let idx_var = VARIANT::from(i);
-        let disp = match unsafe { shell_windows.Item(&idx_var) } {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let wb: IWebBrowser2 = match disp.cast() {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
-        let h_raw = match unsafe { wb.HWND() } {
-            Ok(h) => h.0,
-            Err(_) => continue,
-        };
-        let tab_hwnd = HWND(h_raw as *mut std::ffi::c_void);
-        if tab_hwnd.0 == tab.0 {
-            return Some(wb);
-        }
-    }
-    None
-}
