@@ -70,11 +70,17 @@ fn try_merge(shell_windows: &IShellWindows, new_window: &IDispatch) -> WinResult
     };
 
     // Navigate the freshly-created tab to the URL. Navigate2 takes one VARIANT for URL plus
-    // four optional VARIANTs (flags/target/postdata/headers); we only set the URL.
+    // four optional VARIANTs (flags/target/postdata/headers); we only set the URL — the rest
+    // are passed as None which Explorer treats as defaults.
     unsafe {
         let url_var = VARIANT::from(location_bstr);
-        let empty = VARIANT::new();
-        new_tab_wb.Navigate2(&url_var, &empty, &empty, &empty, &empty)?;
+        new_tab_wb.Navigate2(
+            Some(&url_var as *const VARIANT),
+            None,
+            None,
+            None,
+            None,
+        )?;
     }
 
     // Dispose of the original spawned window. Quit() is the COM-clean route.

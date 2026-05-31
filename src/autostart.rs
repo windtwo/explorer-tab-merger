@@ -8,8 +8,8 @@ use windows::core::{Error, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
-    REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE,
+    REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -112,7 +112,7 @@ fn write_value(subkey: &str, value_name: &str, value: &str) -> Result<(), Error>
 
     unsafe {
         let mut key = HKEY::default();
-        let mut disposition = 0u32;
+        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(subkey_w.as_ptr()),
