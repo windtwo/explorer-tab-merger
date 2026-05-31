@@ -2,9 +2,9 @@
 
 //! Explorer Tab Merger — process entry.
 //!
-//! Single STA thread, single COM apartment, single GetMessage loop. All work happens
-//! synchronously inside the IDispatch sink (`tab_merger::on_new_window`) or in the
-//! watchdog timer tick.
+//! Single STA thread, single COM apartment, single GetMessage loop. Detection of new
+//! Explorer windows is via `SetWinEventHook(EVENT_OBJECT_SHOW)`; the callback runs on
+//! this thread's message queue. The merge work happens synchronously inside that callback.
 
 use std::cell::RefCell;
 use std::env;
@@ -14,7 +14,7 @@ use windows::core::Result as WinResult;
 use windows::Win32::Foundation::{HWND, RPC_E_DISCONNECTED};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
-    COINIT_APARTMENTTHREADED, IDispatch,
+    COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{IShellWindows, ShellWindows};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -28,7 +28,8 @@ const WATCHDOG_INTERVAL_MS: u32 = 10_000;
 
 struct App {
     shell_windows: IShellWindows,
-    subscription: Option<shell_events::Subscription>,
+    /// Held to keep the WinEvent hook alive; dropped on shutdown to unhook.
+    _hook: Option<shell_events::Subscription>,
 }
 
 impl App {
@@ -37,20 +38,19 @@ impl App {
             unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)? };
         Ok(Self {
             shell_windows,
-            subscription: None,
+            _hook: None,
         })
     }
 
-    fn subscribe(this: Rc<RefCell<Self>>) -> WinResult<()> {
-        let shell_windows = this.borrow().shell_windows.clone();
+    fn install_hook(this: Rc<RefCell<Self>>) -> WinResult<()> {
         let weak = Rc::downgrade(&this);
-        let sub = shell_events::subscribe(&shell_windows, move |dispatch: IDispatch| {
+        let hook = shell_events::subscribe(move |hwnd: HWND| {
             if let Some(app) = weak.upgrade() {
                 let sw = app.borrow().shell_windows.clone();
-                tab_merger::on_new_window(&sw, dispatch);
+                tab_merger::on_window_shown(&sw, hwnd);
             }
         })?;
-        this.borrow_mut().subscription = Some(sub);
+        this.borrow_mut()._hook = Some(hook);
         Ok(())
     }
 
@@ -65,7 +65,6 @@ impl App {
 }
 
 fn main() {
-    // Refuse to start a second instance.
     let _guard = match single_instance::acquire() {
         Some(g) => g,
         None => return,
@@ -79,7 +78,6 @@ fn main() {
         }
     }
 
-    // Idempotent autostart. Best-effort: if it fails, we keep running anyway.
     if let Ok(exe) = env::current_exe() {
         if let Err(e) = autostart::ensure_run(&exe) {
             log::write(&format!("autostart register failed: {:?}", e));
@@ -95,13 +93,14 @@ fn main() {
         }
     };
 
-    if let Err(e) = App::subscribe(app.clone()) {
-        log::write(&format!("Advise failed: {:?}", e));
+    if let Err(e) = App::install_hook(app.clone()) {
+        log::write(&format!("SetWinEventHook failed: {:?}", e));
         unsafe { CoUninitialize() };
         return;
     }
 
-    // Watchdog: WM_TIMER posted to this thread's queue every 10 s.
+    log::write("ready: hook installed, awaiting EVENT_OBJECT_SHOW");
+
     unsafe {
         SetTimer(HWND(std::ptr::null_mut()), WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None);
     }
@@ -112,9 +111,7 @@ fn main() {
         let _ = KillTimer(HWND(std::ptr::null_mut()), WATCHDOG_TIMER_ID);
     }
 
-    // Drop subscription (calls Unadvise) before CoUninitialize.
     drop(app);
-
     unsafe { CoUninitialize() };
 }
 
@@ -124,7 +121,7 @@ fn run_message_loop(app: Rc<RefCell<App>>) {
         loop {
             let r = GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0);
             if r.0 == 0 {
-                break; // WM_QUIT
+                break;
             }
             if r.0 == -1 {
                 log::write("GetMessageW returned -1");
@@ -147,10 +144,7 @@ fn watchdog_tick(app: &Rc<RefCell<App>>) {
         return;
     }
 
-    log::write("ShellWindows disconnected; attempting reconnect");
-
-    // Drop the dead subscription before creating a new one.
-    app.borrow_mut().subscription = None;
+    log::write("ShellWindows disconnected; reconnecting");
 
     let new_app = match App::new() {
         Ok(a) => a,
@@ -159,8 +153,8 @@ fn watchdog_tick(app: &Rc<RefCell<App>>) {
             return;
         }
     };
+    // The WinEvent hook is independent of the COM channel; preserve it across reconnect.
+    let old_hook = app.borrow_mut()._hook.take();
     *app.borrow_mut() = new_app;
-    if let Err(e) = App::subscribe(app.clone()) {
-        log::write(&format!("re-subscribe failed: {:?}", e));
-    }
+    app.borrow_mut()._hook = old_hook;
 }
