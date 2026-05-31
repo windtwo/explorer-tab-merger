@@ -24,34 +24,48 @@ const WAIT_NEW_TAB_POLL_MS: u64 = 25;
 const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
 const WAIT_WB_POLL_MS: u64 = 25;
 
-/// Entry point called by the WinEvent hook on each `EVENT_OBJECT_SHOW`.
+/// Called on `EVENT_OBJECT_CREATE`. Fires before the window's first paint, so cloaking
+/// here actually prevents the visible flash. Any cloak applied is "speculative" — if
+/// the subsequent SHOW handler decides not to merge, it must uncloak.
+pub fn on_window_created(hwnd: HWND) {
+    if let Some(class) = win_util::get_window_class(hwnd) {
+        if class == win_util::CABINET_WCLASS {
+            win_util::cloak(hwnd);
+        }
+    }
+}
+
+/// Called on `EVENT_OBJECT_SHOW`. The window is fully initialised by now and is either
+/// a fresh window (already cloaked by [`on_window_created`]) or an existing one being
+/// re-shown (un-minimised, etc., NOT cloaked).
 pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
     let class = match win_util::get_window_class(hwnd) {
         Some(c) => c,
         None => return,
     };
     if class != win_util::CABINET_WCLASS {
-        return; // not File Explorer — silently ignore (very frequent path)
+        return; // very frequent path
     }
 
-    // Existing top-level window being re-shown (un-minimised, focus change after we already
-    // gave it a tab from a previous merge) → leave alone, do NOT cloak.
+    // Multi-tab → existing window being re-shown. Defensive uncloak in case some other
+    // path cloaked it (no-op otherwise; DwmSetWindowAttribute(CLOAK, 0) is idempotent).
     if win_util::find_tab_handles(hwnd).len() > 1 {
+        win_util::uncloak(hwnd);
         return;
     }
 
-    // No other Explorer window to merge into — first window of the session, etc. Let it
-    // live as a normal visible window.
+    // First Explorer window of the session — no host to merge into. Uncloak so user
+    // sees it.
     let host = match win_util::select_host(hwnd) {
         Some(h) => h,
-        None => return,
+        None => {
+            win_util::uncloak(hwnd);
+            return;
+        }
     };
 
-    // Single-tab CabinetWClass with a real host candidate → merge it.
-    // CLOAK before the user can perceive a flash. If merge fails we uncloak to give the
-    // window back; on success, new_wb.Quit() destroys the (still-cloaked) window so the
-    // user never sees it at all.
-    win_util::cloak(hwnd);
+    // Real merge. Window was cloaked at CREATE; on success Quit() destroys it (still
+    // invisible); on failure we uncloak to hand it back to the user.
     if let Err(e) = try_merge(shell_windows, hwnd, host) {
         log::write(&format!("merge failed for {:?}: {:?}", hwnd.0, e));
         win_util::uncloak(hwnd);

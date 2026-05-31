@@ -1,14 +1,12 @@
-//! Global "new window shown" detector using `SetWinEventHook(EVENT_OBJECT_SHOW)`.
+//! Global window-event hook covering EVENT_OBJECT_CREATE and EVENT_OBJECT_SHOW.
 //!
-//! We tried `IShellWindowsEvents::WindowRegistered` first; on Windows 11 it does not
-//! reliably fire for newly-spawned top-level Explorer windows (only for the per-tab
-//! IShellBrowser revoke/register sequence). Falling back to the WinEvent hook — same
-//! mechanism the original w4po/ExplorerTabUtility uses — catches every window-show
-//! across the system, and we filter for `CabinetWClass` in the callback.
+//! Two events instead of one: CREATE fires *before* the window's first paint, which
+//! lets us DWM-cloak a candidate Explorer window before the user can perceive it.
+//! SHOW fires once the window is fully initialised — that's when we run the actual merge.
 //!
 //! With `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`, the callback runs on whatever
-//! thread is pumping messages for the calling thread (ours, since we own the message
-//! loop). So no synchronisation is needed between the callback and the rest of the app.
+//! thread is pumping messages for the calling thread (ours), so no synchronisation is
+//! needed between the callback and the rest of the app.
 
 use std::cell::RefCell;
 
@@ -16,21 +14,24 @@ use windows::core::{Error, Result as WinResult};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_SHOW, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
 };
 
-type Callback = Box<dyn Fn(HWND)>;
+type Callback = Box<dyn Fn(u32, HWND)>;
 
 thread_local! {
     static CALLBACK: RefCell<Option<Callback>> = RefCell::new(None);
 }
 
-pub fn subscribe(callback: impl Fn(HWND) + 'static) -> WinResult<Subscription> {
+/// Subscribe to OBJID_WINDOW CREATE+SHOW events system-wide. Callback receives the event
+/// ID (`EVENT_OBJECT_CREATE` or `EVENT_OBJECT_SHOW`) and the HWND.
+pub fn subscribe(callback: impl Fn(u32, HWND) + 'static) -> WinResult<Subscription> {
     CALLBACK.with(|c| *c.borrow_mut() = Some(Box::new(callback)));
 
     let hook = unsafe {
         SetWinEventHook(
-            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_CREATE,
             EVENT_OBJECT_SHOW,
             None,
             Some(win_event_proc),
@@ -56,13 +57,17 @@ unsafe extern "system" fn win_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    // We only care about top-level window show events.
-    if event != EVENT_OBJECT_SHOW || id_object != OBJID_WINDOW.0 {
+    // Only care about top-level windows themselves, not children/objects on them.
+    if id_object != OBJID_WINDOW.0 {
+        return;
+    }
+    // SetWinEventHook(CREATE..SHOW) also delivers EVENT_OBJECT_DESTROY (0x8001); skip.
+    if event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW {
         return;
     }
     CALLBACK.with(|c| {
         if let Some(cb) = c.borrow().as_ref() {
-            cb(hwnd);
+            cb(event, hwnd);
         }
     });
 }

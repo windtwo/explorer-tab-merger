@@ -18,7 +18,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::{IShellWindows, ShellWindows};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, KillTimer, SetTimer, TranslateMessage, MSG, WM_TIMER,
+    DispatchMessageW, GetMessageW, KillTimer, SetTimer, TranslateMessage, EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_SHOW, MSG, WM_TIMER,
 };
 
 use explorer_tab_merger::{autostart, log, shell_events, single_instance, tab_merger};
@@ -44,10 +45,16 @@ impl App {
 
     fn install_hook(this: Rc<RefCell<Self>>) -> WinResult<()> {
         let weak = Rc::downgrade(&this);
-        let hook = shell_events::subscribe(move |hwnd: HWND| {
-            if let Some(app) = weak.upgrade() {
-                let sw = app.borrow().shell_windows.clone();
-                tab_merger::on_window_shown(&sw, hwnd);
+        let hook = shell_events::subscribe(move |event: u32, hwnd: HWND| {
+            match event {
+                EVENT_OBJECT_CREATE => tab_merger::on_window_created(hwnd),
+                EVENT_OBJECT_SHOW => {
+                    if let Some(app) = weak.upgrade() {
+                        let sw = app.borrow().shell_windows.clone();
+                        tab_merger::on_window_shown(&sw, hwnd);
+                    }
+                }
+                _ => {}
             }
         })?;
         this.borrow_mut()._hook = Some(hook);
