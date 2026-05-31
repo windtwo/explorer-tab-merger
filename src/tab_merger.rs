@@ -2,6 +2,9 @@
 //!
 //! Called from the WinEvent hook on the STA message-loop thread. Synchronous; failures
 //! degrade gracefully (the user's window is preserved).
+//!
+//! No logging on the happy path — the spec mandates a silent log for routine operation.
+//! Only errors and the IShellWindows snapshot (on lookup failure) are written.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -17,9 +20,9 @@ const WAIT_NEW_TAB_TIMEOUT_MS: u64 = 2_000;
 const WAIT_NEW_TAB_POLL_MS: u64 = 25;
 
 /// How long to wait for IShellWindows to register the new tab. Win11 has been observed
-/// taking several seconds for this — much longer than the visual appearance of the tab.
+/// taking up to a few seconds.
 const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
-const WAIT_WB_POLL_MS: u64 = 50;
+const WAIT_WB_POLL_MS: u64 = 25;
 
 /// Entry point called by the WinEvent hook on each `EVENT_OBJECT_SHOW`.
 pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
@@ -27,37 +30,27 @@ pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
         Some(c) => c,
         None => return,
     };
-
     if class != win_util::CABINET_WCLASS {
-        return; // not File Explorer — the frequent path; silently ignore
+        return; // not File Explorer — silently ignore (very frequent path)
     }
-
     if let Err(e) = try_merge(shell_windows, hwnd) {
         log::write(&format!("merge failed for {:?}: {:?}", hwnd.0, e));
     }
 }
 
 fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
+    // Existing window (un-minimised or a tab landing here from us) → leave alone.
     let tab_count = win_util::find_tab_handles(new_top).len();
-    log::write(&format!("event: top={:?} tabs={}", new_top.0, tab_count));
-
-    // Existing window (un-minimised or our own newly-added tab landing) → skip.
     if tab_count > 1 {
-        log::write("skip: multi-tab existing window");
         return Ok(());
     }
 
     let host = match win_util::select_host(new_top) {
         Some(h) => h,
-        None => {
-            log::write("skip: no host candidate");
-            return Ok(());
-        }
+        None => return Ok(()), // no host: let new window live
     };
 
-    log::write(&format!("merging {:?} -> {:?}", new_top.0, host.0));
-
-    // Need the new top-level's IWebBrowser2 to read its URL. Poll briefly.
+    // Need the new top-level's IWebBrowser2 to read its URL.
     let new_wb = match wait_for_wb_for_top_level(shell_windows, new_top) {
         Some(wb) => wb,
         None => {
@@ -68,38 +61,28 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
         }
     };
 
-    // Snapshot: how many IShellWindows entries currently map to host? After we trigger
-    // a new tab, this count grows by one, and the newly-registered entry is the
-    // most-recently-added (highest index) entry that matches host.
+    // Snapshot host's IShellWindows entry count BEFORE we trigger a new tab; we'll wait
+    // for it to grow by one and then take the newest matching entry.
     let host_entry_count_before = count_entries_for_top(shell_windows, host);
     let tabs_before: Vec<HWND> = win_util::find_tab_handles(host);
-    log::write(&format!(
-        "before WM_COMMAND: host has {} IShellWindows entries, {} ShellTabWindowClass children",
-        host_entry_count_before,
-        tabs_before.len()
-    ));
 
     win_util::request_new_tab(host)?;
 
-    // The tab HWND appears quickly; the IShellWindows registration is much slower.
-    let new_tab = match wait_for_new_tab(host, &tabs_before) {
-        Some(h) => h,
-        None => {
-            return Err(windows::core::Error::new(
-                E_FAIL,
-                "timeout waiting for new tab to appear",
-            ));
-        }
-    };
-    log::write(&format!("new tab hwnd={:?}", new_tab.0));
+    // Confirm the tab HWND appears (fast — just window-tree mutation).
+    if wait_for_new_tab(host, &tabs_before).is_none() {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            "timeout waiting for new tab to appear",
+        ));
+    }
 
-    // Read target URL from the original new window before destroying it.
+    // Read URL before we destroy the original window.
     let location_bstr: BSTR = unsafe { new_wb.LocationURL()? };
-    log::write(&format!("location = {:?}", location_bstr.to_string()));
 
-    // Wait for the new IShellWindows entry to materialise, then take the newest one
-    // matching host (reverse iteration). This is critical: navigating an older entry
-    // would land the URL in the wrong tab.
+    // Wait for the new IShellWindows entry. In Win11 each tab IS its own entry, but they
+    // all report the same top-level HWND, so we can't distinguish by HWND — we rely on
+    // ordering: new entries get appended, so the newest matching entry (reverse iteration)
+    // is our freshly-created tab.
     let nav_wb = match wait_for_new_host_entry(shell_windows, host, host_entry_count_before) {
         Some(wb) => wb,
         None => {
@@ -110,13 +93,12 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
             ));
         }
     };
-    log::write("got newest host WB, navigating");
 
-    // Optional VARIANT params: COM requires non-null pointers (to VT_EMPTY), not NULL.
-    // Passing `None` (raw NULL) errors with RPC_X_NULL_REF_POINTER (0x800706F4).
+    // Optional VARIANT params: COM here needs non-null pointers to VT_EMPTY VARIANTs,
+    // not real NULL. Passing None errors with RPC_X_NULL_REF_POINTER (0x800706F4).
     unsafe {
         let url_var = VARIANT::from(location_bstr);
-        let empty = VARIANT::default(); // VT_EMPTY
+        let empty = VARIANT::default();
         nav_wb.Navigate2(
             &url_var as *const VARIANT,
             Some(&empty as *const VARIANT),
@@ -125,7 +107,6 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
             Some(&empty as *const VARIANT),
         )?;
     }
-    log::write("Navigate2 succeeded");
 
     // Quit the original spawned window (its single tab — closes the top-level).
     unsafe {
@@ -133,7 +114,6 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
     }
 
     win_util::bring_to_foreground(host);
-    log::write("merge complete");
     Ok(())
 }
 
@@ -162,8 +142,8 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
     None
 }
 
-/// Wait until IShellWindows has registered a NEW entry for `host` (i.e., the host's entry
-/// count exceeds `base_count`), then return the newest such entry (highest index).
+/// Wait until host's IShellWindows entry count exceeds `base_count`, then return the
+/// most-recently-added matching entry.
 fn wait_for_new_host_entry(
     shell_windows: &IShellWindows,
     host: HWND,
@@ -185,33 +165,19 @@ fn count_entries_for_top(shell_windows: &IShellWindows, top: HWND) -> usize {
         Ok(c) => c,
         Err(_) => return 0,
     };
-    let mut hits = 0usize;
-    for i in 0..count {
-        if entry_top(shell_windows, i).map(|t| t.0 == top.0).unwrap_or(false) {
-            hits += 1;
-        }
-    }
-    hits
+    (0..count)
+        .filter(|i| entry_top(shell_windows, *i).map(|t| t.0 == top.0).unwrap_or(false))
+        .count()
 }
 
 fn find_first_wb_for_top(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
     let count = unsafe { shell_windows.Count().ok()? };
-    for i in 0..count {
-        if let Some(wb) = wb_if_top_matches(shell_windows, i, top) {
-            return Some(wb);
-        }
-    }
-    None
+    (0..count).find_map(|i| wb_if_top_matches(shell_windows, i, top))
 }
 
 fn find_last_wb_for_top(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
     let count = unsafe { shell_windows.Count().ok()? };
-    for i in (0..count).rev() {
-        if let Some(wb) = wb_if_top_matches(shell_windows, i, top) {
-            return Some(wb);
-        }
-    }
-    None
+    (0..count).rev().find_map(|i| wb_if_top_matches(shell_windows, i, top))
 }
 
 fn wb_if_top_matches(
@@ -225,11 +191,7 @@ fn wb_if_top_matches(
     let h_raw = unsafe { wb.HWND() }.ok()?.0;
     let hwnd = HWND(h_raw as *mut std::ffi::c_void);
     let top = win_util::top_level_window(hwnd);
-    if top.0 == target_top.0 {
-        Some(wb)
-    } else {
-        None
-    }
+    if top.0 == target_top.0 { Some(wb) } else { None }
 }
 
 fn entry_top(shell_windows: &IShellWindows, index: i32) -> Option<HWND> {
@@ -241,7 +203,7 @@ fn entry_top(shell_windows: &IShellWindows, index: i32) -> Option<HWND> {
     Some(win_util::top_level_window(hwnd))
 }
 
-/// Dump IShellWindows contents to the log. Useful when something went wrong.
+/// Dumps IShellWindows contents to the log. Only called on failure paths.
 fn log_shell_windows_snapshot(shell_windows: &IShellWindows, label: &str) {
     let count = match unsafe { shell_windows.Count() } {
         Ok(c) => c,

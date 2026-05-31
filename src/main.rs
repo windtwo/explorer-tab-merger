@@ -99,8 +99,6 @@ fn main() {
         return;
     }
 
-    log::write("ready: hook installed, awaiting EVENT_OBJECT_SHOW");
-
     unsafe {
         SetTimer(HWND(std::ptr::null_mut()), WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None);
     }
