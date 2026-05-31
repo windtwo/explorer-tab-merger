@@ -16,21 +16,20 @@ use crate::win_util;
 const WAIT_NEW_TAB_TIMEOUT_MS: u64 = 2_000;
 const WAIT_NEW_TAB_POLL_MS: u64 = 25;
 
-const WAIT_WB_TIMEOUT_MS: u64 = 1_500;
-const WAIT_WB_POLL_MS: u64 = 25;
+/// How long to wait for IShellWindows to register the new tab. Win11 has been observed
+/// taking several seconds for this — much longer than the visual appearance of the tab.
+const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
+const WAIT_WB_POLL_MS: u64 = 50;
 
 /// Entry point called by the WinEvent hook on each `EVENT_OBJECT_SHOW`.
-///
-/// `hwnd` is whatever window just got shown — could be anything system-wide. We filter
-/// inside.
 pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
     let class = match win_util::get_window_class(hwnd) {
         Some(c) => c,
-        None => return, // window probably already gone
+        None => return,
     };
 
     if class != win_util::CABINET_WCLASS {
-        return; // not a File Explorer top-level — silently ignore (frequent path)
+        return; // not File Explorer — the frequent path; silently ignore
     }
 
     if let Err(e) = try_merge(shell_windows, hwnd) {
@@ -40,15 +39,9 @@ pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
 
 fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
     let tab_count = win_util::find_tab_handles(new_top).len();
+    log::write(&format!("event: top={:?} tabs={}", new_top.0, tab_count));
 
-    log::write(&format!(
-        "event: top={:?} tabs={}",
-        new_top.0, tab_count
-    ));
-
-    // If the top-level window already has more than one tab, this is an EXISTING window
-    // that's just being re-shown (un-minimised or re-focused) OR our own merge just added
-    // a tab to it. Either way, leave it alone.
+    // Existing window (un-minimised or our own newly-added tab landing) → skip.
     if tab_count > 1 {
         log::write("skip: multi-tab existing window");
         return Ok(());
@@ -64,68 +57,77 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND) -> WinResult<()> {
 
     log::write(&format!("merging {:?} -> {:?}", new_top.0, host.0));
 
-    // Find the IWebBrowser2 corresponding to the new top-level window. The shell may not
-    // have registered it in IShellWindows yet, so poll briefly.
+    // Need the new top-level's IWebBrowser2 to read its URL. Poll briefly.
     let new_wb = match wait_for_wb_for_top_level(shell_windows, new_top) {
         Some(wb) => wb,
         None => {
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "IWebBrowser2 for new top-level not found in time",
+                "IWebBrowser2 for new top-level not found",
             ));
         }
     };
 
-    // Snapshot current host tabs so we can detect the freshly added one.
+    // Snapshot: how many IShellWindows entries currently map to host? After we trigger
+    // a new tab, this count grows by one, and the newly-registered entry is the
+    // most-recently-added (highest index) entry that matches host.
+    let host_entry_count_before = count_entries_for_top(shell_windows, host);
     let tabs_before: Vec<HWND> = win_util::find_tab_handles(host);
+    log::write(&format!(
+        "before WM_COMMAND: host has {} IShellWindows entries, {} ShellTabWindowClass children",
+        host_entry_count_before,
+        tabs_before.len()
+    ));
 
     win_util::request_new_tab(host)?;
 
+    // The tab HWND appears quickly; the IShellWindows registration is much slower.
     let new_tab = match wait_for_new_tab(host, &tabs_before) {
         Some(h) => h,
         None => {
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "timeout waiting for new tab to appear in host",
+                "timeout waiting for new tab to appear",
             ));
         }
     };
+    log::write(&format!("new tab hwnd={:?}", new_tab.0));
 
-    // Read target URL from the original window before we destroy it.
+    // Read target URL from the original new window before destroying it.
     let location_bstr: BSTR = unsafe { new_wb.LocationURL()? };
     log::write(&format!("location = {:?}", location_bstr.to_string()));
-    let _ = new_tab; // we navigate via the host's WB; the new_tab HWND is just our "WM_COMMAND succeeded" signal
 
-    // Navigation strategy: in Windows 11, each Explorer top-level window appears to expose
-    // a SINGLE IShellBrowser through IShellWindows — representing the currently-active tab,
-    // not per-tab entries. Since WM_COMMAND 0xA21B not only creates a new tab but also
-    // makes it active, we can find the HOST's IWebBrowser2 and Navigate2 on it; the
-    // navigation lands in the new tab.
-    log_shell_windows_snapshot(shell_windows, "before navigate");
-
-    let nav_wb = match wait_for_wb_for_top_level(shell_windows, host) {
+    // Wait for the new IShellWindows entry to materialise, then take the newest one
+    // matching host (reverse iteration). This is critical: navigating an older entry
+    // would land the URL in the wrong tab.
+    let nav_wb = match wait_for_new_host_entry(shell_windows, host, host_entry_count_before) {
         Some(wb) => wb,
         None => {
+            log_shell_windows_snapshot(shell_windows, "wait_for_new_host_entry timeout");
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "could not locate host's IWebBrowser2",
+                "timeout waiting for new host IShellWindows entry",
             ));
         }
     };
+    log::write("got newest host WB, navigating");
 
+    // Optional VARIANT params: COM requires non-null pointers (to VT_EMPTY), not NULL.
+    // Passing `None` (raw NULL) errors with RPC_X_NULL_REF_POINTER (0x800706F4).
     unsafe {
         let url_var = VARIANT::from(location_bstr);
+        let empty = VARIANT::default(); // VT_EMPTY
         nav_wb.Navigate2(
             &url_var as *const VARIANT,
-            None,
-            None,
-            None,
-            None,
+            Some(&empty as *const VARIANT),
+            Some(&empty as *const VARIANT),
+            Some(&empty as *const VARIANT),
+            Some(&empty as *const VARIANT),
         )?;
     }
+    log::write("Navigate2 succeeded");
 
-    // Dispose of the originally-spawned top-level. Quit() closes the browser tab; for a
-    // single-tab top-level this also closes the top-level itself.
+    // Quit the original spawned window (its single tab — closes the top-level).
     unsafe {
         let _ = new_wb.Quit();
     }
@@ -152,7 +154,7 @@ fn wait_for_new_tab(host: HWND, before: &[HWND]) -> Option<HWND> {
 fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
-        if let Some(wb) = find_wb_matching(shell_windows, |wb_top| wb_top.0 == top.0) {
+        if let Some(wb) = find_first_wb_for_top(shell_windows, top) {
             return Some(wb);
         }
         sleep(Duration::from_millis(WAIT_WB_POLL_MS));
@@ -160,67 +162,111 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
     None
 }
 
-/// Dump the IShellWindows collection contents to the log — useful for diagnosing why a
-/// merge can't find the IWebBrowser2 it expects.
-fn log_shell_windows_snapshot(shell_windows: &IShellWindows, label: &str) {
-    let count = match unsafe { shell_windows.Count() } {
-        Ok(c) => c,
-        Err(e) => {
-            log::write(&format!("snapshot[{}]: Count failed: {:?}", label, e));
-            return;
+/// Wait until IShellWindows has registered a NEW entry for `host` (i.e., the host's entry
+/// count exceeds `base_count`), then return the newest such entry (highest index).
+fn wait_for_new_host_entry(
+    shell_windows: &IShellWindows,
+    host: HWND,
+    base_count: usize,
+) -> Option<IWebBrowser2> {
+    let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
+    while Instant::now() < deadline {
+        let current = count_entries_for_top(shell_windows, host);
+        if current > base_count {
+            return find_last_wb_for_top(shell_windows, host);
         }
-    };
-    log::write(&format!("snapshot[{}]: count={}", label, count));
-    for i in 0..count {
-        let idx_var = VARIANT::from(i);
-        let entry_desc = match unsafe { shell_windows.Item(&idx_var) } {
-            Ok(disp) => match disp.cast::<IWebBrowser2>() {
-                Ok(wb) => match unsafe { wb.HWND() } {
-                    Ok(h) => {
-                        let hwnd = HWND(h.0 as *mut std::ffi::c_void);
-                        let top = win_util::top_level_window(hwnd);
-                        let class = win_util::get_window_class(hwnd).unwrap_or_default();
-                        let top_class = win_util::get_window_class(top).unwrap_or_default();
-                        format!(
-                            "wb hwnd={:?}({}) top={:?}({})",
-                            hwnd.0, class, top.0, top_class
-                        )
-                    }
-                    Err(e) => format!("wb (HWND err: {:?})", e),
-                },
-                Err(_) => "(not IWebBrowser2)".to_string(),
-            },
-            Err(e) => format!("Item({}) err: {:?}", i, e),
-        };
-        log::write(&format!("  [{}] {}", i, entry_desc));
+        sleep(Duration::from_millis(WAIT_WB_POLL_MS));
     }
+    None
 }
 
-fn find_wb_matching(
-    shell_windows: &IShellWindows,
-    predicate: impl Fn(HWND) -> bool,
-) -> Option<IWebBrowser2> {
+fn count_entries_for_top(shell_windows: &IShellWindows, top: HWND) -> usize {
+    let count = match unsafe { shell_windows.Count() } {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut hits = 0usize;
+    for i in 0..count {
+        if entry_top(shell_windows, i).map(|t| t.0 == top.0).unwrap_or(false) {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+fn find_first_wb_for_top(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
     let count = unsafe { shell_windows.Count().ok()? };
     for i in 0..count {
-        let idx_var = VARIANT::from(i);
-        let disp = match unsafe { shell_windows.Item(&idx_var) } {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let wb: IWebBrowser2 = match disp.cast() {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
-        let h_raw = match unsafe { wb.HWND() } {
-            Ok(h) => h.0,
-            Err(_) => continue,
-        };
-        let tab_hwnd = HWND(h_raw as *mut std::ffi::c_void);
-        let top = win_util::top_level_window(tab_hwnd);
-        if predicate(top) {
+        if let Some(wb) = wb_if_top_matches(shell_windows, i, top) {
             return Some(wb);
         }
     }
     None
 }
 
+fn find_last_wb_for_top(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
+    let count = unsafe { shell_windows.Count().ok()? };
+    for i in (0..count).rev() {
+        if let Some(wb) = wb_if_top_matches(shell_windows, i, top) {
+            return Some(wb);
+        }
+    }
+    None
+}
+
+fn wb_if_top_matches(
+    shell_windows: &IShellWindows,
+    index: i32,
+    target_top: HWND,
+) -> Option<IWebBrowser2> {
+    let idx_var = VARIANT::from(index);
+    let disp = unsafe { shell_windows.Item(&idx_var) }.ok()?;
+    let wb: IWebBrowser2 = disp.cast().ok()?;
+    let h_raw = unsafe { wb.HWND() }.ok()?.0;
+    let hwnd = HWND(h_raw as *mut std::ffi::c_void);
+    let top = win_util::top_level_window(hwnd);
+    if top.0 == target_top.0 {
+        Some(wb)
+    } else {
+        None
+    }
+}
+
+fn entry_top(shell_windows: &IShellWindows, index: i32) -> Option<HWND> {
+    let idx_var = VARIANT::from(index);
+    let disp = unsafe { shell_windows.Item(&idx_var) }.ok()?;
+    let wb: IWebBrowser2 = disp.cast().ok()?;
+    let h_raw = unsafe { wb.HWND() }.ok()?.0;
+    let hwnd = HWND(h_raw as *mut std::ffi::c_void);
+    Some(win_util::top_level_window(hwnd))
+}
+
+/// Dump IShellWindows contents to the log. Useful when something went wrong.
+fn log_shell_windows_snapshot(shell_windows: &IShellWindows, label: &str) {
+    let count = match unsafe { shell_windows.Count() } {
+        Ok(c) => c,
+        Err(e) => {
+            log::write(&format!("snapshot[{}]: Count err: {:?}", label, e));
+            return;
+        }
+    };
+    log::write(&format!("snapshot[{}]: count={}", label, count));
+    for i in 0..count {
+        let desc = match unsafe { shell_windows.Item(&VARIANT::from(i)) } {
+            Ok(disp) => match disp.cast::<IWebBrowser2>() {
+                Ok(wb) => match unsafe { wb.HWND() } {
+                    Ok(h) => {
+                        let hwnd = HWND(h.0 as *mut std::ffi::c_void);
+                        let top = win_util::top_level_window(hwnd);
+                        let cls = win_util::get_window_class(hwnd).unwrap_or_default();
+                        format!("hwnd={:?}({}) top={:?}", hwnd.0, cls, top.0)
+                    }
+                    Err(e) => format!("(HWND err {:?})", e),
+                },
+                Err(_) => "(not IWebBrowser2)".into(),
+            },
+            Err(e) => format!("(Item err {:?})", e),
+        };
+        log::write(&format!("  [{}] {}", i, desc));
+    }
+}
