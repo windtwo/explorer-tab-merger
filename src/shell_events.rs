@@ -15,13 +15,12 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows::core::{implement, Interface, Result as WinResult, Error, GUID, PCWSTR};
+use windows::core::{implement, Interface, Result as WinResult, Error, GUID, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{E_NOTIMPL, HWND};
 use windows::Win32::System::Com::{
     IConnectionPoint, IConnectionPointContainer, IDispatch, IDispatch_Impl, ITypeInfo,
     DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO,
 };
-use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::IWebBrowser2;
 use windows::Win32::UI::WindowsAndMessaging::{

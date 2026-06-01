@@ -179,9 +179,9 @@ fn pump_until_navigated(flag: &std::rc::Rc<std::cell::Cell<bool>>, timeout_ms: u
         let remaining_ms = (deadline - now).as_millis().min(50) as u32;
         unsafe {
             // Wait until a message arrives or up to remaining_ms.
+            // windows-rs 0.58 signature: phandles: Option<&[HANDLE]>, timeout, wake mask, flags.
             let _ = MsgWaitForMultipleObjectsEx(
-                0,
-                std::ptr::null(),
+                None,
                 remaining_ms,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
