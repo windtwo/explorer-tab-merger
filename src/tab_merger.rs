@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, Result as WinResult, BSTR, VARIANT};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage,
+    MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
+};
 
 use crate::cloak;
 use crate::log;
+use crate::shell_events;
 use crate::win_util;
 
 const WAIT_NEW_TAB_TIMEOUT_MS: u64 = 2_000;
@@ -24,6 +29,11 @@ const WAIT_NEW_TAB_POLL_MS: u64 = 5;
 /// taking up to a few seconds.
 const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
 const WAIT_WB_POLL_MS: u64 = 5;
+
+/// How long to pump messages waiting for `NavigateComplete2` after issuing `Navigate2`.
+/// If this fires we know navigation truly landed; if it doesn't, Explorer never made
+/// the trip and the new tab is stuck at "This PC" / default-tab content.
+const NAV_COMPLETE_TIMEOUT_MS: u64 = 3_000;
 
 /// Called on `EVENT_OBJECT_CREATE`. Fires before the window's first paint, so cloaking
 /// here actually prevents the visible flash. Any cloak applied is "speculative" — if
@@ -119,6 +129,10 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
         }
     };
 
+    // Subscribe to NavigateComplete2 on the new tab's WB *before* issuing Navigate2,
+    // so we don't miss the event if it fires synchronously.
+    let watch = shell_events::watch_navigate_complete(&nav_wb)?;
+
     // Optional VARIANT params: COM here needs non-null pointers to VT_EMPTY VARIANTs,
     // not real NULL. Passing None errors with RPC_X_NULL_REF_POINTER (0x800706F4).
     unsafe {
@@ -133,6 +147,17 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
         )?;
     }
 
+    // Wait for NavigateComplete2. Without pumping messages, the COM event sink would
+    // never run. We use MsgWaitForMultipleObjectsEx + PeekMessage to drain the queue.
+    let completed = pump_until_navigated(&watch.completed, NAV_COMPLETE_TIMEOUT_MS);
+    if !completed {
+        log::write(&format!(
+            "Navigate2 did NOT complete in {} ms (new tab may be left at default page) for {:?}",
+            NAV_COMPLETE_TIMEOUT_MS, new_top.0
+        ));
+    }
+    drop(watch); // Unadvise
+
     // Quit the original spawned window (its single tab — closes the top-level).
     unsafe {
         let _ = new_wb.Quit();
@@ -140,6 +165,36 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
 
     win_util::bring_to_foreground(host);
     Ok(())
+}
+
+/// Pump messages on this STA thread until `flag` becomes true or the timeout expires.
+/// Returns whether `flag` was observed true.
+fn pump_until_navigated(flag: &std::rc::Rc<std::cell::Cell<bool>>, timeout_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while !flag.get() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining_ms = (deadline - now).as_millis().min(50) as u32;
+        unsafe {
+            // Wait until a message arrives or up to remaining_ms.
+            let _ = MsgWaitForMultipleObjectsEx(
+                0,
+                std::ptr::null(),
+                remaining_ms,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+            // Drain whatever's queued.
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    flag.get()
 }
 
 fn wait_for_new_tab(host: HWND, before: &[HWND]) -> Option<HWND> {

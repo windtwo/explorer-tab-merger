@@ -1,18 +1,29 @@
-//! Global window-event hook covering EVENT_OBJECT_CREATE and EVENT_OBJECT_SHOW.
+//! Global window-event hook + per-WB NavigateComplete2 sink.
 //!
-//! Two events instead of one: CREATE fires *before* the window's first paint, which
-//! lets us DWM-cloak a candidate Explorer window before the user can perceive it.
-//! SHOW fires once the window is fully initialised — that's when we run the actual merge.
+//! 1. WinEvent hook (CREATE..SHOW): lets us cloak new Explorer windows before their
+//!    first paint and trigger the merge once they're fully initialised.
 //!
-//! With `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`, the callback runs on whatever
-//! thread is pumping messages for the calling thread (ours), so no synchronisation is
-//! needed between the callback and the rest of the app.
+//! 2. NavigateComplete2 sink: implements `IDispatch` and subscribes to a specific
+//!    `IWebBrowser2`'s `DWebBrowserEvents2::NavigateComplete2`. Used by the merger to
+//!    know when a freshly-issued `Navigate2` has truly landed (rather than guessing
+//!    with a sleep).
+//!
+//! With `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`, the WinEvent callback runs
+//! on whatever thread is pumping messages for the calling thread (ours), so no
+//! synchronisation is needed between the callback and the rest of the app.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
-use windows::core::{Error, Result as WinResult};
-use windows::Win32::Foundation::HWND;
+use windows::core::{implement, Interface, Result as WinResult, Error, GUID, PCWSTR};
+use windows::Win32::Foundation::{E_NOTIMPL, HWND};
+use windows::Win32::System::Com::{
+    IConnectionPoint, IConnectionPointContainer, IDispatch, IDispatch_Impl, ITypeInfo,
+    DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO,
+};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Shell::IWebBrowser2;
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS,
@@ -80,5 +91,89 @@ impl Drop for Subscription {
             let _ = UnhookWinEvent(self.0);
         }
         CALLBACK.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NavigateComplete2 sink
+// ---------------------------------------------------------------------------
+
+const DIID_D_WEB_BROWSER_EVENTS_2: GUID =
+    GUID::from_u128(0x34A715A0_6587_11D0_924A_0020AFC7AC4D);
+/// `DISPID_NAVIGATECOMPLETE2` from `exdispid.h`.
+const DISPID_NAVIGATE_COMPLETE_2: i32 = 252;
+
+#[implement(IDispatch)]
+struct NavigateCompleteSink {
+    completed: Rc<Cell<bool>>,
+}
+
+impl IDispatch_Impl for NavigateCompleteSink_Impl {
+    fn GetTypeInfoCount(&self) -> WinResult<u32> {
+        Ok(0)
+    }
+    fn GetTypeInfo(&self, _itinfo: u32, _lcid: u32) -> WinResult<ITypeInfo> {
+        Err(E_NOTIMPL.into())
+    }
+    fn GetIDsOfNames(
+        &self,
+        _riid: *const GUID,
+        _rgsznames: *const PCWSTR,
+        _cnames: u32,
+        _lcid: u32,
+        _rgdispid: *mut i32,
+    ) -> WinResult<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn Invoke(
+        &self,
+        dispidmember: i32,
+        _riid: *const GUID,
+        _lcid: u32,
+        _wflags: DISPATCH_FLAGS,
+        _pdispparams: *const DISPPARAMS,
+        _pvarresult: *mut VARIANT,
+        _pexcepinfo: *mut EXCEPINFO,
+        _puargerr: *mut u32,
+    ) -> WinResult<()> {
+        if dispidmember == DISPID_NAVIGATE_COMPLETE_2 {
+            self.completed.set(true);
+        }
+        Ok(())
+    }
+}
+
+/// Subscribe to a specific `IWebBrowser2`'s `NavigateComplete2` event. Returns a
+/// [`NavigateCompleteWatch`] whose `completed` flag flips `true` when navigation lands.
+/// Drop the watch to unsubscribe.
+pub fn watch_navigate_complete(wb: &IWebBrowser2) -> WinResult<NavigateCompleteWatch> {
+    let cpc: IConnectionPointContainer = wb.cast()?;
+    let cp = unsafe { cpc.FindConnectionPoint(&DIID_D_WEB_BROWSER_EVENTS_2)? };
+
+    let completed = Rc::new(Cell::new(false));
+    let sink: IDispatch = NavigateCompleteSink {
+        completed: completed.clone(),
+    }
+    .into();
+
+    let cookie = unsafe { cp.Advise(&sink)? };
+    Ok(NavigateCompleteWatch {
+        cp,
+        cookie,
+        completed,
+    })
+}
+
+pub struct NavigateCompleteWatch {
+    cp: IConnectionPoint,
+    cookie: u32,
+    pub completed: Rc<Cell<bool>>,
+}
+
+impl Drop for NavigateCompleteWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.cp.Unadvise(self.cookie);
+        }
     }
 }
