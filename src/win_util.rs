@@ -4,12 +4,13 @@
 //! All public functions in this module are safe wrappers; unsafe blocks are confined to the
 //! actual Win32 call site.
 
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM};
+use windows::core::{Error, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
-    GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SW_SHOWNORMAL, WS_EX_LAYERED,
+    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, IsWindow,
+    PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    WS_EX_LAYERED,
 };
 
 /// File Explorer's top-level window class.
@@ -17,6 +18,13 @@ pub const CABINET_WCLASS: &str = "CabinetWClass";
 
 /// The class used by Explorer for each tab's hosting window. Children of CABINET_WCLASS.
 pub const SHELL_TAB_WCLASS: &str = "ShellTabWindowClass";
+
+/// Undocumented Explorer command IDs (community-known, used by the original
+/// w4po/ExplorerTabUtility):
+/// - 0xA21B: "New Tab"
+/// - 0xA021: close active tab
+/// - 0xA221 + 1-based index: activate tab N (unused here)
+pub const CMD_NEW_TAB: u32 = 0xA21B;
 
 /// Enumerate every top-level window whose class is `CabinetWClass`.
 pub fn find_all_explorer_windows() -> Vec<HWND> {
@@ -48,6 +56,10 @@ pub fn get_window_class(hwnd: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
+pub fn is_explorer(hwnd: HWND) -> bool {
+    get_window_class(hwnd).as_deref() == Some(CABINET_WCLASS)
+}
+
 /// Walk up to the top-level (GA_ROOT) ancestor. Returns the input unchanged if it has
 /// no ancestor.
 pub fn top_level_window(hwnd: HWND) -> HWND {
@@ -77,6 +89,32 @@ pub fn find_tab_handles(host: HWND) -> Vec<HWND> {
     out
 }
 
+/// The first `ShellTabWindowClass` child, or `HWND(null)` if the host has none.
+pub fn first_tab_handle(host: HWND) -> HWND {
+    let class_w = HSTRING::from(SHELL_TAB_WCLASS);
+    unsafe {
+        FindWindowExW(
+            host,
+            HWND(std::ptr::null_mut()),
+            PCWSTR(class_w.as_ptr()),
+            PCWSTR::null(),
+        )
+        .unwrap_or(HWND(std::ptr::null_mut()))
+    }
+}
+
+/// Post the Explorer "new tab" command. Returns Err if the host has no tab child to target.
+pub fn request_new_tab(host: HWND) -> Result<(), Error> {
+    let tab = first_tab_handle(host);
+    if tab.0.is_null() {
+        return Err(Error::from_win32());
+    }
+    unsafe {
+        PostMessageW(tab, WM_COMMAND, WPARAM(CMD_NEW_TAB as usize), LPARAM(0))?;
+    }
+    Ok(())
+}
+
 /// Hide the window by making it a layered window with alpha=0 (fully transparent).
 /// This is the same mechanism the original w4po project uses (see Helper.HideWindow,
 /// non-keepTheme branch).
@@ -102,6 +140,15 @@ pub fn cloak(hwnd: HWND) {
 pub fn uncloak(hwnd: HWND) {
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    }
+}
+
+pub fn close_window(hwnd: HWND) {
+    if !unsafe { IsWindow(hwnd).as_bool() } {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
     }
 }
 
