@@ -13,6 +13,7 @@ use windows::core::{Interface, Result as WinResult, BSTR, VARIANT};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
 
+use crate::cloak;
 use crate::log;
 use crate::win_util;
 
@@ -30,14 +31,12 @@ const WAIT_WB_POLL_MS: u64 = 5;
 pub fn on_window_created(hwnd: HWND) {
     if let Some(class) = win_util::get_window_class(hwnd) {
         if class == win_util::CABINET_WCLASS {
-            win_util::cloak(hwnd);
+            cloak::cloak(hwnd);
         }
     }
 }
 
-/// Called on `EVENT_OBJECT_SHOW`. The window is fully initialised by now and is either
-/// a fresh window (already cloaked by [`on_window_created`]) or an existing one being
-/// re-shown (un-minimised, etc., NOT cloaked).
+/// Called on `EVENT_OBJECT_SHOW`.
 pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
     let class = match win_util::get_window_class(hwnd) {
         Some(c) => c,
@@ -47,28 +46,31 @@ pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
         return; // very frequent path
     }
 
-    // Multi-tab → existing window being re-shown. Defensive uncloak in case some other
-    // path cloaked it (no-op otherwise; DwmSetWindowAttribute(CLOAK, 0) is idempotent).
+    // Multi-tab → existing window being re-shown. Defensive uncloak in case some path
+    // cloaked it (idempotent for windows we don't track).
     if win_util::find_tab_handles(hwnd).len() > 1 {
-        win_util::uncloak(hwnd);
+        cloak::uncloak(hwnd);
         return;
     }
 
-    // First Explorer window of the session — no host to merge into. Uncloak so user
-    // sees it.
+    // First Explorer window of the session — no host to merge into.
     let host = match win_util::select_host(hwnd) {
         Some(h) => h,
         None => {
-            win_util::uncloak(hwnd);
+            cloak::uncloak(hwnd);
             return;
         }
     };
 
     // Real merge. Window was cloaked at CREATE; on success Quit() destroys it (still
-    // invisible); on failure we uncloak to hand it back to the user.
-    if let Err(e) = try_merge(shell_windows, hwnd, host) {
-        log::write(&format!("merge failed for {:?}: {:?}", hwnd.0, e));
-        win_util::uncloak(hwnd);
+    // invisible) and we `forget` it in the tracker; on failure we uncloak to hand it
+    // back to the user.
+    match try_merge(shell_windows, hwnd, host) {
+        Ok(()) => cloak::forget(hwnd),
+        Err(e) => {
+            log::write(&format!("merge failed for {:?}: {:?}", hwnd.0, e));
+            cloak::uncloak(hwnd);
+        }
     }
 }
 

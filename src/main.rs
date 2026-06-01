@@ -22,7 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_SHOW, MSG, WM_TIMER,
 };
 
-use explorer_tab_merger::{autostart, log, shell_events, single_instance, tab_merger};
+use explorer_tab_merger::{
+    autostart, cloak, conflicts, log, shell_events, single_instance, tab_merger,
+};
 
 const WATCHDOG_TIMER_ID: usize = 1;
 const WATCHDOG_INTERVAL_MS: u32 = 10_000;
@@ -91,6 +93,20 @@ fn main() {
         }
     }
 
+    // Warn about other tools that compete for the same job.
+    let detected = conflicts::detect_running();
+    if !detected.is_empty() {
+        log::write(&format!(
+            "WARNING: other tools detected that may race for new Explorer windows: {:?}. \
+             Recommended: close them or stop this merger.",
+            detected
+        ));
+    }
+
+    // Salvage anything a previous crashed instance left behind (cloaked Explorer windows
+    // that are still on screen but invisible).
+    cloak::recover_orphans();
+
     let app = match App::new() {
         Ok(a) => Rc::new(RefCell::new(a)),
         Err(e) => {
@@ -115,6 +131,10 @@ fn main() {
     unsafe {
         let _ = KillTimer(HWND(std::ptr::null_mut()), WATCHDOG_TIMER_ID);
     }
+
+    // Best-effort cleanup before exit: anything we left cloaked must be restored, or the
+    // user gets a permanently invisible Explorer window.
+    cloak::uncloak_all();
 
     drop(app);
     unsafe { CoUninitialize() };
@@ -145,6 +165,9 @@ fn run_message_loop(app: Rc<RefCell<App>>) {
 }
 
 fn watchdog_tick(app: &Rc<RefCell<App>>) {
+    // Safety net: uncloak any window we cloaked but never finished processing. Cheap.
+    cloak::sweep_stale();
+
     if app.borrow().is_alive() {
         return;
     }

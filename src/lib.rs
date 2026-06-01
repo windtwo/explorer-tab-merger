@@ -5,6 +5,8 @@
 //! (`log`, `autostart`) for verification.
 
 pub mod autostart;
+pub mod cloak;
+pub mod conflicts;
 pub mod log;
 pub mod shell_events;
 pub mod single_instance;

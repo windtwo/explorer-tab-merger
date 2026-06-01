@@ -1,0 +1,128 @@
+//! Cloak tracker: state-managed wrapper around `win_util::cloak`/`uncloak`.
+//!
+//! Why track: a window could be cloaked but the SHOW handler that would normally
+//! uncloak/Quit it might never run (rare timing race, or the process gets killed
+//! mid-merge). Without tracking we could leave Explorer windows permanently invisible.
+//!
+//! Safety nets exposed here:
+//! - [`sweep_stale`] — called from the watchdog every 10 s; uncloaks anything held
+//!   longer than [`STALE_THRESHOLD`].
+//! - [`uncloak_all`] — called on graceful exit.
+//! - [`recover_orphans`] — called at startup; finds any CabinetWClass top-level with
+//!   `WS_EX_LAYERED` + alpha < 255 (left over from a crashed previous instance) and
+//!   restores its opacity.
+//!
+//! All state is thread-local because we live on a single STA thread.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetLayeredWindowAttributes, GetWindowLongPtrW, GWL_EXSTYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
+    LWA_ALPHA, WS_EX_LAYERED,
+};
+
+use crate::log;
+use crate::win_util;
+
+/// Windows cloaked longer than this without being released → safety-net uncloak.
+const STALE_THRESHOLD: Duration = Duration::from_secs(5);
+
+thread_local! {
+    static CLOAKED: RefCell<HashMap<usize, Instant>> = RefCell::new(HashMap::new());
+}
+
+fn key(hwnd: HWND) -> usize {
+    hwnd.0 as usize
+}
+
+fn hwnd_from_key(k: usize) -> HWND {
+    HWND(k as *mut std::ffi::c_void)
+}
+
+/// Cloak the window and remember it.
+pub fn cloak(hwnd: HWND) {
+    win_util::cloak(hwnd);
+    CLOAKED.with(|m| {
+        m.borrow_mut().insert(key(hwnd), Instant::now());
+    });
+}
+
+/// Uncloak the window and forget it.
+pub fn uncloak(hwnd: HWND) {
+    let was_tracked = CLOAKED.with(|m| m.borrow_mut().remove(&key(hwnd)).is_some());
+    // Always restore opacity, even for windows we don't recognise — idempotent and safe.
+    win_util::uncloak(hwnd);
+    let _ = was_tracked;
+}
+
+/// Forget the window — it's been destroyed (e.g., by `IWebBrowser2::Quit`) so we no
+/// longer need to track or uncloak it. Idempotent.
+pub fn forget(hwnd: HWND) {
+    CLOAKED.with(|m| {
+        m.borrow_mut().remove(&key(hwnd));
+    });
+}
+
+/// Safety net: uncloak any window that's been held cloaked beyond [`STALE_THRESHOLD`].
+pub fn sweep_stale() {
+    let now = Instant::now();
+    let stale: Vec<HWND> = CLOAKED.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > STALE_THRESHOLD)
+            .map(|(k, _)| hwnd_from_key(*k))
+            .collect()
+    });
+    for hwnd in stale {
+        log::write(&format!("safety net: uncloaking stale {:?}", hwnd.0));
+        uncloak(hwnd);
+    }
+}
+
+/// Uncloak everything we're tracking and clear the map. Call on graceful exit.
+pub fn uncloak_all() {
+    let all: Vec<HWND> = CLOAKED.with(|m| {
+        m.borrow()
+            .keys()
+            .map(|k| hwnd_from_key(*k))
+            .collect()
+    });
+    for hwnd in all {
+        win_util::uncloak(hwnd);
+    }
+    CLOAKED.with(|m| m.borrow_mut().clear());
+}
+
+/// Startup recovery: if a previous run of us crashed mid-merge, Explorer windows may
+/// still be sitting around with `WS_EX_LAYERED` + alpha < 255 (invisible to the user).
+/// Walk all CabinetWClass top-levels and restore opacity on any that look cloaked.
+pub fn recover_orphans() {
+    let mut restored = 0usize;
+    for hwnd in win_util::find_all_explorer_windows() {
+        unsafe {
+            let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if (exstyle as u32) & WS_EX_LAYERED.0 == 0 {
+                continue; // not layered → not us
+            }
+            let mut alpha: u8 = 0;
+            let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+            if GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags))
+                .is_ok()
+                && (flags.0 & LWA_ALPHA.0) != 0
+                && alpha < 255
+            {
+                win_util::uncloak(hwnd);
+                restored += 1;
+            }
+        }
+    }
+    if restored > 0 {
+        log::write(&format!(
+            "startup recovery: restored {} orphan-cloaked window(s)",
+            restored
+        ));
+    }
+}
