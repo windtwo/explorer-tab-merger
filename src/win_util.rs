@@ -159,8 +159,16 @@ pub fn bring_to_foreground(hwnd: HWND) {
     }
 }
 
-/// Pick the best host among existing Explorer windows: highest tab count, excluding `other_than`.
-/// Returns `None` if no other Explorer window exists.
+/// A host is rejected once it has this many tabs. Empirical observation: when a Win11
+/// Explorer top-level holds ~17 tabs, the WM_COMMAND new-tab command starts being
+/// silently dropped — and pushing further appears to destabilise Explorer (we've seen
+/// crashes of explorer.exe under that condition). Capping below the limit forces a
+/// new top-level to be created naturally, which the next merge will then host into.
+const MAX_HOST_TABS: usize = 15;
+
+/// Pick the best host among existing Explorer windows: highest tab count, excluding
+/// `other_than`, and rejecting any host already at or above [`MAX_HOST_TABS`].
+/// Returns `None` if no eligible Explorer window exists.
 pub fn select_host(other_than: HWND) -> Option<HWND> {
     let mut candidates: Vec<(HWND, usize)> = find_all_explorer_windows()
         .into_iter()
@@ -169,6 +177,7 @@ pub fn select_host(other_than: HWND) -> Option<HWND> {
             let n = find_tab_handles(h).len();
             (h, n)
         })
+        .filter(|(_, n)| *n < MAX_HOST_TABS)
         .collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1));
     candidates.into_iter().next().map(|(h, _)| h)
