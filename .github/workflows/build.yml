@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Default GITHUB_TOKEN is read-only for `contents`. Tag pushes need write to create a Release.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
