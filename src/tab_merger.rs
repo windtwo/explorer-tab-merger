@@ -25,10 +25,11 @@ use crate::win_util;
 const WAIT_NEW_TAB_TIMEOUT_MS: u64 = 2_000;
 const WAIT_NEW_TAB_POLL_MS: u64 = 5;
 
-/// How long to wait for IShellWindows to register the new tab. Win11 has been observed
-/// taking up to a few seconds.
-const WAIT_WB_TIMEOUT_MS: u64 = 5_000;
-const WAIT_WB_POLL_MS: u64 = 5;
+/// How long to wait for IShellWindows to register the new tab. Win11 sometimes takes
+/// 5-7 s for this under load (empirically), so we go to 10 s. Poll cadence is 25 ms
+/// because we do a full O(N) iteration every poll now (see wait_for_new_host_entry).
+const WAIT_WB_TIMEOUT_MS: u64 = 10_000;
+const WAIT_WB_POLL_MS: u64 = 25;
 
 /// How long to pump messages waiting for `NavigateComplete2` after issuing `Navigate2`.
 /// If this fires we know navigation truly landed; if it doesn't, Explorer never made
@@ -236,34 +237,30 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
 /// Wait until host's IShellWindows entry count exceeds `base_count`, then return the
 /// most-recently-added matching entry.
 ///
-/// Hot loop: probe `Count()` (1 COM call) every poll; only run the O(N) host-match
-/// iteration when the total entry count has actually changed. Without this, polling at
-/// 5 ms × ~5 entries × ~3 COM calls per entry = sustained noticeable CPU during the wait.
+/// We do a full host-match scan on every poll. A previous version optimised this by
+/// only re-scanning when `Count()` changed — but real logs showed it missing the
+/// new entry (likely COM-proxy stale-cache effects, or the increment landing in a
+/// window between our polls without us seeing a different value). The full scan is
+/// the safe baseline; the 25 ms cadence keeps CPU minimal.
 ///
-/// IMPORTANT: we MUST do a host-match check before the loop too. The new entry can
-/// register between the caller measuring `base_count` and us calling `Count()` for
-/// `last_total` — if that happens, `Count()` would never change during the loop and
-/// we'd wait until timeout despite the result being already available.
+/// A final post-deadline check covers entries that registered exactly at the timeout
+/// boundary.
 fn wait_for_new_host_entry(
     shell_windows: &IShellWindows,
     host: HWND,
     base_count: usize,
 ) -> Option<IWebBrowser2> {
-    if count_entries_for_top(shell_windows, host) > base_count {
-        return find_last_wb_for_top(shell_windows, host);
-    }
-
-    let mut last_total = unsafe { shell_windows.Count() }.unwrap_or(-1);
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
-        let current_total = unsafe { shell_windows.Count() }.unwrap_or(-1);
-        if current_total != last_total {
-            last_total = current_total;
-            if count_entries_for_top(shell_windows, host) > base_count {
-                return find_last_wb_for_top(shell_windows, host);
-            }
+        if count_entries_for_top(shell_windows, host) > base_count {
+            return find_last_wb_for_top(shell_windows, host);
         }
         sleep(Duration::from_millis(WAIT_WB_POLL_MS));
+    }
+    // One last shot — covers the case where the entry registered between the last
+    // poll and the timeout firing.
+    if count_entries_for_top(shell_windows, host) > base_count {
+        return find_last_wb_for_top(shell_windows, host);
     }
     None
 }
