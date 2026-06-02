@@ -91,7 +91,7 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
         None => {
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "IWebBrowser2 for new top-level not found",
+                "[wait_wb_top] IWebBrowser2 for new top-level not found",
             ));
         }
     };
@@ -101,18 +101,19 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
     let host_entry_count_before = count_entries_for_top(shell_windows, host);
     let tabs_before: Vec<HWND> = win_util::find_tab_handles(host);
 
-    win_util::request_new_tab(host)?;
+    win_util::request_new_tab(host).map_err(|e| ctx(e, "request_new_tab"))?;
 
     // Confirm the tab HWND appears (fast — just window-tree mutation).
     if wait_for_new_tab(host, &tabs_before).is_none() {
         return Err(windows::core::Error::new(
             E_FAIL,
-            "timeout waiting for new tab to appear",
+            "[wait_new_tab] timeout waiting for new ShellTabWindowClass child",
         ));
     }
 
     // Read URL before we destroy the original window.
-    let location_bstr: BSTR = unsafe { new_wb.LocationURL()? };
+    let location_bstr: BSTR =
+        unsafe { new_wb.LocationURL() }.map_err(|e| ctx(e, "LocationURL"))?;
 
     // Wait for the new IShellWindows entry. In Win11 each tab IS its own entry, but they
     // all report the same top-level HWND, so we can't distinguish by HWND — we rely on
@@ -124,27 +125,30 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
             log_shell_windows_snapshot(shell_windows, "wait_for_new_host_entry timeout");
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "timeout waiting for new host IShellWindows entry",
+                "[wait_new_entry] timeout waiting for new IShellWindows entry",
             ));
         }
     };
 
     // Subscribe to NavigateComplete2 on the new tab's WB *before* issuing Navigate2,
     // so we don't miss the event if it fires synchronously.
-    let watch = shell_events::watch_navigate_complete(&nav_wb)?;
+    let watch =
+        shell_events::watch_navigate_complete(&nav_wb).map_err(|e| ctx(e, "watch_navigate"))?;
 
     // Optional VARIANT params: COM here needs non-null pointers to VT_EMPTY VARIANTs,
     // not real NULL. Passing None errors with RPC_X_NULL_REF_POINTER (0x800706F4).
     unsafe {
         let url_var = VARIANT::from(location_bstr);
         let empty = VARIANT::default();
-        nav_wb.Navigate2(
-            &url_var as *const VARIANT,
-            Some(&empty as *const VARIANT),
-            Some(&empty as *const VARIANT),
-            Some(&empty as *const VARIANT),
-            Some(&empty as *const VARIANT),
-        )?;
+        nav_wb
+            .Navigate2(
+                &url_var as *const VARIANT,
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+                Some(&empty as *const VARIANT),
+            )
+            .map_err(|e| ctx(e, "Navigate2"))?;
     }
 
     // Wait for NavigateComplete2. Without pumping messages, the COM event sink would
@@ -165,6 +169,13 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
 
     win_util::bring_to_foreground(host);
     Ok(())
+}
+
+/// Wrap a windows::core::Error with the name of the step that failed, so the merge-
+/// failed log line tells us which COM call returned the generic E_FAIL / RPC error.
+fn ctx(e: windows::core::Error, step: &'static str) -> windows::core::Error {
+    let msg = format!("[{}] {}", step, e.message());
+    windows::core::Error::new(e.code(), msg)
 }
 
 /// Pump messages on this STA thread until `flag` becomes true or the timeout expires.
@@ -228,11 +239,20 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
 /// Hot loop: probe `Count()` (1 COM call) every poll; only run the O(N) host-match
 /// iteration when the total entry count has actually changed. Without this, polling at
 /// 5 ms × ~5 entries × ~3 COM calls per entry = sustained noticeable CPU during the wait.
+///
+/// IMPORTANT: we MUST do a host-match check before the loop too. The new entry can
+/// register between the caller measuring `base_count` and us calling `Count()` for
+/// `last_total` — if that happens, `Count()` would never change during the loop and
+/// we'd wait until timeout despite the result being already available.
 fn wait_for_new_host_entry(
     shell_windows: &IShellWindows,
     host: HWND,
     base_count: usize,
 ) -> Option<IWebBrowser2> {
+    if count_entries_for_top(shell_windows, host) > base_count {
+        return find_last_wb_for_top(shell_windows, host);
+    }
+
     let mut last_total = unsafe { shell_windows.Count() }.unwrap_or(-1);
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
