@@ -27,7 +27,10 @@ use explorer_tab_merger::{
 };
 
 const WATCHDOG_TIMER_ID: usize = 1;
-const WATCHDOG_INTERVAL_MS: u32 = 10_000;
+/// Watchdog now ticks every 1 s (was 10 s) because cloak's STALE_THRESHOLD is 2 s —
+/// we need to sweep often enough that no cloaked window outlives that threshold by
+/// much. Tick body is cheap (a Count() COM probe + a hashmap scan).
+const WATCHDOG_INTERVAL_MS: u32 = 1_000;
 
 struct App {
     shell_windows: IShellWindows,

@@ -28,7 +28,16 @@ use crate::log;
 use crate::win_util;
 
 /// Windows cloaked longer than this without being released → safety-net uncloak.
-const STALE_THRESHOLD: Duration = Duration::from_secs(5);
+///
+/// Kept short (2 s) for a reason: when external apps (WeChat, file managers,
+/// "Show in folder" from any app) spawn an Explorer window, Explorer often takes
+/// 5-10 s to fully initialise the new tab's IWebBrowser2 — long enough that our
+/// merge waits exhaust their per-step timeouts. While that's happening the user
+/// sees NOTHING (the window is cloaked). At 2 s we give the window back so the user
+/// at least sees their folder; the merge may still complete in the background and
+/// Quit the now-visible window, causing a brief disappear-and-reappear-as-tab
+/// effect — acceptable, much better than 10 s of invisibility.
+const STALE_THRESHOLD: Duration = Duration::from_secs(2);
 
 thread_local! {
     static CLOAKED: RefCell<HashMap<usize, Instant>> = RefCell::new(HashMap::new());
