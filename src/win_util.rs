@@ -1,17 +1,16 @@
-//! Thin Win32 helpers used by the merger: window enumeration, the Explorer "new tab"
-//! WM_COMMAND, and foreground/close.
+//! Thin Win32 helpers used by the merger: Explorer-window enumeration, the "new tab"
+//! WM_COMMAND, cloak via WS_EX_LAYERED, host selection, and foreground activation.
 //!
-//! All public functions in this module are safe wrappers; unsafe blocks are confined to the
-//! actual Win32 call site.
+//! All public functions are safe wrappers; unsafe blocks are confined to the actual
+//! Win32 call site.
 
 use windows::core::{Error, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, IsWindow,
-    PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WM_CLOSE,
-    WM_COMMAND, WS_EX_LAYERED,
+    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, PostMessageW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WM_COMMAND, WS_EX_LAYERED,
 };
 
 /// File Explorer's top-level window class.
@@ -55,10 +54,6 @@ pub fn get_window_class(hwnd: HWND) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&buf[..len as usize]))
-}
-
-pub fn is_explorer(hwnd: HWND) -> bool {
-    get_window_class(hwnd).as_deref() == Some(CABINET_WCLASS)
 }
 
 /// Walk up to the top-level (GA_ROOT) ancestor. Returns the input unchanged if it has
@@ -169,15 +164,6 @@ pub fn uncloak(hwnd: HWND) {
         // Belt-and-braces: explicitly show the window. No-op if already visible; covers
         // the rare case where WS_VISIBLE got cleared or the window was minimised.
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-    }
-}
-
-pub fn close_window(hwnd: HWND) {
-    if !unsafe { IsWindow(hwnd).as_bool() } {
-        return;
-    }
-    unsafe {
-        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
     }
 }
 

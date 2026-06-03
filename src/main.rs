@@ -2,9 +2,11 @@
 
 //! Explorer Tab Merger — process entry.
 //!
-//! Single STA thread, single COM apartment, single GetMessage loop. Detection of new
-//! Explorer windows is via `SetWinEventHook(EVENT_OBJECT_SHOW)`; the callback runs on
-//! this thread's message queue. The merge work happens synchronously inside that callback.
+//! Single STA thread, single COM apartment, single GetMessage loop. New-window detection
+//! uses `SetWinEventHook` covering `EVENT_OBJECT_CREATE..EVENT_OBJECT_SHOW`; CREATE
+//! fires before first paint so we can DWM-cloak in time, SHOW triggers the actual
+//! merge. Both callbacks run on this thread's message queue (via WINEVENT_OUTOFCONTEXT),
+//! so the merge happens synchronously inside the callback.
 
 use std::cell::RefCell;
 use std::env;
@@ -27,9 +29,9 @@ use explorer_tab_merger::{
 };
 
 const WATCHDOG_TIMER_ID: usize = 1;
-/// Watchdog now ticks every 1 s (was 10 s) because cloak's STALE_THRESHOLD is 2 s —
-/// we need to sweep often enough that no cloaked window outlives that threshold by
-/// much. Tick body is cheap (a Count() COM probe + a hashmap scan).
+/// Watchdog ticks every 1 s. Two jobs: drive cloak::sweep_stale (safety net for stuck
+/// cloaks; threshold 5 s) and probe IShellWindows for an Explorer.exe-crash reconnect.
+/// Tick body is microseconds: a hashmap scan + one COM Count() call.
 const WATCHDOG_INTERVAL_MS: u32 = 1_000;
 
 struct App {

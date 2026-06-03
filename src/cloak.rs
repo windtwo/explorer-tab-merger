@@ -5,8 +5,9 @@
 //! mid-merge). Without tracking we could leave Explorer windows permanently invisible.
 //!
 //! Safety nets exposed here:
-//! - [`sweep_stale`] — called from the watchdog every 10 s; uncloaks anything held
-//!   longer than [`STALE_THRESHOLD`].
+//! - [`sweep_stale`] — called from the watchdog (every 1 s); uncloaks anything held
+//!   longer than [`STALE_THRESHOLD`] (5 s). The merger's wait loops call [`touch`]
+//!   each poll iteration, so a slow-but-progressing merge keeps its cloak.
 //! - [`uncloak_all`] — called on graceful exit.
 //! - [`recover_orphans`] — called at startup; finds any CabinetWClass top-level with
 //!   `WS_EX_LAYERED` + alpha < 255 (left over from a crashed previous instance) and
