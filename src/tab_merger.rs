@@ -96,8 +96,11 @@ pub fn on_window_shown(shell_windows: &IShellWindows, hwnd: HWND) {
 }
 
 fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinResult<()> {
+    // Refresh cloak timestamp on entry so the sweep doesn't fire while we're working.
+    cloak::touch(new_top);
+
     // Need the new top-level's IWebBrowser2 to read its URL.
-    let new_wb = match wait_for_wb_for_top_level(shell_windows, new_top) {
+    let new_wb = match wait_for_wb_for_top_level(shell_windows, new_top, new_top) {
         Some(wb) => wb,
         None => {
             return Err(windows::core::Error::new(
@@ -115,7 +118,7 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
     win_util::request_new_tab(host).map_err(|e| ctx(e, "request_new_tab"))?;
 
     // Confirm the tab HWND appears (fast — just window-tree mutation).
-    if wait_for_new_tab(host, &tabs_before).is_none() {
+    if wait_for_new_tab(host, &tabs_before, new_top).is_none() {
         return Err(windows::core::Error::new(
             E_FAIL,
             "[wait_new_tab] timeout waiting for new ShellTabWindowClass child",
@@ -229,7 +232,7 @@ fn pump_until_navigated(
     flag.get()
 }
 
-fn wait_for_new_tab(host: HWND, before: &[HWND]) -> Option<HWND> {
+fn wait_for_new_tab(host: HWND, before: &[HWND], keepalive_hwnd: HWND) -> Option<HWND> {
     let deadline = Instant::now() + Duration::from_millis(WAIT_NEW_TAB_TIMEOUT_MS);
     while Instant::now() < deadline {
         let now = win_util::find_tab_handles(host);
@@ -238,17 +241,23 @@ fn wait_for_new_tab(host: HWND, before: &[HWND]) -> Option<HWND> {
                 return Some(*t);
             }
         }
+        cloak::touch(keepalive_hwnd);
         sleep(Duration::from_millis(WAIT_NEW_TAB_POLL_MS));
     }
     None
 }
 
-fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option<IWebBrowser2> {
+fn wait_for_wb_for_top_level(
+    shell_windows: &IShellWindows,
+    top: HWND,
+    keepalive_hwnd: HWND,
+) -> Option<IWebBrowser2> {
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
         if let Some(wb) = find_first_wb_for_top(shell_windows, top) {
             return Some(wb);
         }
+        cloak::touch(keepalive_hwnd);
         sleep(Duration::from_millis(WAIT_WB_POLL_MS));
     }
     None
