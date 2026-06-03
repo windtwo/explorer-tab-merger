@@ -9,8 +9,9 @@ use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, IsWindow,
     PostMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
-    WS_EX_LAYERED,
+    SetWindowPos, ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WM_CLOSE,
+    WM_COMMAND, WS_EX_LAYERED,
 };
 
 /// File Explorer's top-level window class.
@@ -135,11 +136,35 @@ pub fn cloak(hwnd: HWND) {
     }
 }
 
-/// Reverse of [`cloak`] — set alpha back to 255 (fully opaque). We leave WS_EX_LAYERED on
-/// the window; removing it is unnecessary and a touch risky (race with paint).
+/// Reverse of [`cloak`]. Three steps, mirroring what the original w4po project does on
+/// uncloak:
+/// 1. Restore alpha to 255 (fully opaque).
+/// 2. **Remove the `WS_EX_LAYERED` style bit.** Without this, some Win11 Explorer
+///    windows (notably those spawned by external apps — WeChat, "Show in folder", etc.)
+///    stay invisible even after alpha=255 because the layered-window rendering path
+///    keeps a stale invisible composition. Removing the style returns the window to
+///    normal rendering and forces a fresh paint.
+/// 3. `SetWindowPos(SWP_FRAMECHANGED)` to tell the compositor to re-evaluate the
+///    frame — a belt-and-braces against any leftover invisible state from step 2.
 pub fn uncloak(hwnd: HWND) {
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered_bit = WS_EX_LAYERED.0 as isize;
+        if exstyle & layered_bit != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle & !layered_bit);
+        }
+
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(std::ptr::null_mut()),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
 
