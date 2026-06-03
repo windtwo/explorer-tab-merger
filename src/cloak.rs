@@ -29,15 +29,12 @@ use crate::win_util;
 
 /// Windows cloaked longer than this without being released → safety-net uncloak.
 ///
-/// Kept short (2 s) for a reason: when external apps (WeChat, file managers,
-/// "Show in folder" from any app) spawn an Explorer window, Explorer often takes
-/// 5-10 s to fully initialise the new tab's IWebBrowser2 — long enough that our
-/// merge waits exhaust their per-step timeouts. While that's happening the user
-/// sees NOTHING (the window is cloaked). At 2 s we give the window back so the user
-/// at least sees their folder; the merge may still complete in the background and
-/// Quit the now-visible window, causing a brief disappear-and-reappear-as-tab
-/// effect — acceptable, much better than 10 s of invisibility.
-const STALE_THRESHOLD: Duration = Duration::from_secs(2);
+/// The merger's wait loops call [`touch`] each poll iteration, which refreshes this
+/// timestamp — so as long as the merge is actively polling, the safety net does not
+/// fire. The 5 s threshold therefore only triggers if the merger has truly stopped
+/// making progress (a silent hang we never observe via timeout returns), not for
+/// normal slow merges.
+const STALE_THRESHOLD: Duration = Duration::from_secs(5);
 
 thread_local! {
     static CLOAKED: RefCell<HashMap<usize, Instant>> = RefCell::new(HashMap::new());
@@ -72,6 +69,19 @@ pub fn uncloak(hwnd: HWND) {
 pub fn forget(hwnd: HWND) {
     CLOAKED.with(|m| {
         m.borrow_mut().remove(&key(hwnd));
+    });
+}
+
+/// Refresh the cloak timestamp for an already-cloaked window. Called from inside the
+/// merger's polling waits — as long as we're actively making progress, the safety-net
+/// sweep should not fire. If we stop calling `touch` (because the merge errored out
+/// or hung silently), the timestamp ages and sweep eventually uncloaks. No-op if the
+/// window isn't being tracked.
+pub fn touch(hwnd: HWND) {
+    CLOAKED.with(|m| {
+        if let Some(entry) = m.borrow_mut().get_mut(&key(hwnd)) {
+            *entry = Instant::now();
+        }
     });
 }
 

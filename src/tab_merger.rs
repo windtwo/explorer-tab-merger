@@ -129,8 +129,10 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
     // Wait for the new IShellWindows entry. In Win11 each tab IS its own entry, but they
     // all report the same top-level HWND, so we can't distinguish by HWND — we rely on
     // ordering: new entries get appended, so the newest matching entry (reverse iteration)
-    // is our freshly-created tab.
-    let nav_wb = match wait_for_new_host_entry(shell_windows, host, host_entry_count_before) {
+    // is our freshly-created tab. Pass `new_top` so the loop can refresh the cloak
+    // timestamp each poll; without that, a 3-5 s wait here would let the sweep uncloak
+    // the new window prematurely (creating the "appears, then merges" disjointed UX).
+    let nav_wb = match wait_for_new_host_entry(shell_windows, host, host_entry_count_before, new_top) {
         Some(wb) => wb,
         None => {
             log_shell_windows_snapshot(shell_windows, "wait_for_new_host_entry timeout");
@@ -164,7 +166,7 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
 
     // Wait for NavigateComplete2. Without pumping messages, the COM event sink would
     // never run. We use MsgWaitForMultipleObjectsEx + PeekMessage to drain the queue.
-    let completed = pump_until_navigated(&watch.completed, NAV_COMPLETE_TIMEOUT_MS);
+    let completed = pump_until_navigated(&watch.completed, NAV_COMPLETE_TIMEOUT_MS, new_top);
     if !completed {
         log::write(&format!(
             "Navigate2 did NOT complete in {} ms (new tab may be left at default page) for {:?}",
@@ -191,13 +193,21 @@ fn ctx(e: windows::core::Error, step: &'static str) -> windows::core::Error {
 
 /// Pump messages on this STA thread until `flag` becomes true or the timeout expires.
 /// Returns whether `flag` was observed true.
-fn pump_until_navigated(flag: &std::rc::Rc<std::cell::Cell<bool>>, timeout_ms: u64) -> bool {
+///
+/// `keepalive_hwnd` is touched each iteration so the cloak safety net doesn't fire
+/// while we're waiting for navigation to land.
+fn pump_until_navigated(
+    flag: &std::rc::Rc<std::cell::Cell<bool>>,
+    timeout_ms: u64,
+    keepalive_hwnd: HWND,
+) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while !flag.get() {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
+        cloak::touch(keepalive_hwnd);
         let remaining_ms = (deadline - now).as_millis().min(50) as u32;
         unsafe {
             // Wait until a message arrives or up to remaining_ms.
@@ -253,22 +263,25 @@ fn wait_for_wb_for_top_level(shell_windows: &IShellWindows, top: HWND) -> Option
 /// window between our polls without us seeing a different value). The full scan is
 /// the safe baseline; the 25 ms cadence keeps CPU minimal.
 ///
+/// `keepalive_hwnd` is touched each iteration so cloak::sweep_stale doesn't fire
+/// while we're actively polling.
+///
 /// A final post-deadline check covers entries that registered exactly at the timeout
 /// boundary.
 fn wait_for_new_host_entry(
     shell_windows: &IShellWindows,
     host: HWND,
     base_count: usize,
+    keepalive_hwnd: HWND,
 ) -> Option<IWebBrowser2> {
     let deadline = Instant::now() + Duration::from_millis(WAIT_WB_TIMEOUT_MS);
     while Instant::now() < deadline {
         if count_entries_for_top(shell_windows, host) > base_count {
             return find_last_wb_for_top(shell_windows, host);
         }
+        cloak::touch(keepalive_hwnd);
         sleep(Duration::from_millis(WAIT_WB_POLL_MS));
     }
-    // One last shot — covers the case where the entry registered between the last
-    // poll and the timeout firing.
     if count_entries_for_top(shell_windows, host) > base_count {
         return find_last_wb_for_top(shell_windows, host);
     }
