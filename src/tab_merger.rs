@@ -37,13 +37,23 @@ const WAIT_WB_POLL_MS: u64 = 25;
 const NAV_COMPLETE_TIMEOUT_MS: u64 = 3_000;
 
 /// Called on `EVENT_OBJECT_CREATE`. Fires before the window's first paint, so cloaking
-/// here actually prevents the visible flash. Any cloak applied is "speculative" — if
-/// the subsequent SHOW handler decides not to merge, it must uncloak.
+/// here actually prevents the visible flash during a merge.
+///
+/// We only cloak if there's at least one OTHER Explorer window already open — i.e., a
+/// potential merge host. If this is the only Explorer window, there's nothing to merge
+/// into, the window will live as a standalone, and cloaking it would just create the
+/// "stuck invisible after uncloak" failure mode we see for WeChat-spawned windows.
 pub fn on_window_created(hwnd: HWND) {
-    if let Some(class) = win_util::get_window_class(hwnd) {
-        if class == win_util::CABINET_WCLASS {
-            cloak::cloak(hwnd);
-        }
+    let class = match win_util::get_window_class(hwnd) {
+        Some(c) => c,
+        None => return,
+    };
+    if class != win_util::CABINET_WCLASS {
+        return;
+    }
+    // find_all_explorer_windows() includes `hwnd` itself, so we want strictly >1.
+    if win_util::find_all_explorer_windows().len() > 1 {
+        cloak::cloak(hwnd);
     }
 }
 

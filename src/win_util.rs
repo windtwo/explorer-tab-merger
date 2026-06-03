@@ -165,6 +165,10 @@ pub fn uncloak(hwnd: HWND) {
             0,
             SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+
+        // Belt-and-braces: explicitly show the window. No-op if already visible; covers
+        // the rare case where WS_VISIBLE got cleared or the window was minimised.
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
     }
 }
 
