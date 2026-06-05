@@ -9,21 +9,13 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, Result as WinResult, BSTR, GUID, VARIANT};
+use windows::core::{Interface, Result as WinResult, BSTR, VARIANT};
 use windows::Win32::Foundation::{E_FAIL, HWND};
-use windows::Win32::System::Com::{CoTaskMemFree, IServiceProvider};
-use windows::Win32::UI::Shell::{
-    IFolderView, IPersistFolder2, IShellBrowser, IShellView, IShellWindows, IWebBrowser2,
-    SHGetNameFromIDList, SIGDN_DESKTOPABSOLUTEPARSING,
-};
+use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage,
     MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
 };
-
-/// `SID_STopLevelBrowser` — service id used to fetch the top-level `IShellBrowser`
-/// from a window's `IServiceProvider`. Value from `shlguid.h`.
-const SID_S_TOP_LEVEL_BROWSER: GUID = GUID::from_u128(0x4C96BE40_915C_11CF_99D3_00AA004AE837);
 
 use crate::cloak;
 use crate::log;
@@ -118,6 +110,23 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
         }
     };
 
+    // Read the target location BEFORE touching the host. Filesystem folders give a
+    // `file://` URL. Virtual shell folders (Recycle Bin, This PC, Control Panel,
+    // Network, ...) return an EMPTY LocationURL and cannot be navigated to via the
+    // string URL form Navigate2 accepts (a "::{CLSID}" path yields E_INVALIDARG; only
+    // a PIDL-VARIANT works, which isn't worth the extra SafeArray machinery for the
+    // marginal benefit). We don't merge virtual folders — skip cleanly here, before
+    // opening any tab in the host, so we never leave a stray blank tab behind.
+    let location = unsafe { new_wb.LocationURL() }
+        .map(|b| b.to_string())
+        .unwrap_or_default();
+    if location.is_empty() {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            "[skip] virtual shell folder — not merged",
+        ));
+    }
+
     // Snapshot host's IShellWindows entry count BEFORE we trigger a new tab; we'll wait
     // for it to grow by one and then take the newest matching entry.
     let host_entry_count_before = count_entries_for_top(shell_windows, host);
@@ -132,33 +141,6 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
             "[wait_new_tab] timeout waiting for new ShellTabWindowClass child",
         ));
     }
-
-    // Read the target location before we destroy the original window. For filesystem
-    // folders LocationURL is a `file://` URL. For virtual shell folders (Recycle Bin,
-    // Control Panel, This PC, Network, ...) LocationURL is EMPTY — fall back to the
-    // PIDL-derived shell parsing path (e.g. "::{645FF040-...}"), which Navigate2 also
-    // accepts.
-    let location: String = {
-        let url = unsafe { new_wb.LocationURL() }
-            .map(|b| b.to_string())
-            .unwrap_or_default();
-        if !url.is_empty() {
-            url
-        } else {
-            match parsing_path_via_pidl(&new_wb) {
-                Some(p) => {
-                    log::write(&format!("virtual folder fallback path = {:?}", p));
-                    p
-                }
-                None => {
-                    return Err(windows::core::Error::new(
-                        E_FAIL,
-                        "[location] empty LocationURL and PIDL fallback failed",
-                    ));
-                }
-            }
-        }
-    };
 
     // Wait for the new IShellWindows entry. In Win11 each tab IS its own entry, but they
     // all report the same top-level HWND, so we can't distinguish by HWND — we rely on
@@ -223,43 +205,6 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
 fn ctx(e: windows::core::Error, step: &'static str) -> windows::core::Error {
     let msg = format!("[{}] {}", step, e.message());
     windows::core::Error::new(e.code(), msg)
-}
-
-/// Resolve the shell parsing path of the folder a window is currently showing.
-///
-/// Used as a fallback when `IWebBrowser2::LocationURL` is empty, which happens for
-/// virtual shell folders (Recycle Bin, Control Panel, This PC, Network, ...). The chain
-/// is the standard one for getting a window's current PIDL:
-///   IWebBrowser2 → IServiceProvider → IShellBrowser → IShellView → IFolderView
-///   → IPersistFolder2 → GetCurFolder (PIDL) → SHGetNameFromIDList(DESKTOPABSOLUTEPARSING)
-///
-/// The parsing name (e.g. `::{645FF040-5081-101B-9F08-00AA002F954E}` for the Recycle
-/// Bin, or a normal `C:\...` path for filesystem folders) is accepted by `Navigate2`.
-///
-/// Returns `None` if any link in the chain fails. Frees both the PIDL and the returned
-/// string buffer (both are CoTaskMem-allocated).
-fn parsing_path_via_pidl(wb: &IWebBrowser2) -> Option<String> {
-    unsafe {
-        let sp: IServiceProvider = wb.cast().ok()?;
-        let browser: IShellBrowser = sp.QueryService(&SID_S_TOP_LEVEL_BROWSER).ok()?;
-        let view: IShellView = browser.QueryActiveShellView().ok()?;
-        let folder_view: IFolderView = view.cast().ok()?;
-        let persist: IPersistFolder2 = folder_view.GetFolder().ok()?;
-
-        let pidl = persist.GetCurFolder().ok()?; // *mut ITEMIDLIST (raw pointer)
-        let name_result = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING);
-        // Free the PIDL regardless of whether name resolution succeeded.
-        CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
-
-        let pwstr = name_result.ok()?;
-        let s = pwstr.to_string().ok();
-        CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
-
-        match s {
-            Some(ref text) if !text.is_empty() => s,
-            _ => None,
-        }
-    }
 }
 
 /// Pump messages on this STA thread until `flag` becomes true or the timeout expires.
