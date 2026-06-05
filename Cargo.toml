@@ -24,7 +24,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",           # HKCU autostart
     "Win32_System_Threading",          # CreateMutexW for single-instance
     "Win32_System_Diagnostics_ToolHelp", # process enumeration for conflict detection
-    "Win32_UI_Shell",                  # IShellWindows, IWebBrowser2, CLSID_ShellWindows
+    "Win32_UI_Shell",                  # IShellWindows, IWebBrowser2, IShellBrowser/View/FolderView, SHGetNameFromIDList
+    "Win32_UI_Shell_Common",           # ITEMIDLIST / PIDL types
     "Win32_UI_WindowsAndMessaging",    # everything window-related
     "Win32_UI_Accessibility",          # SetWinEventHook / HWINEVENTHOOK
     "implement",                       # #[implement] macro + _Impl traits
