@@ -20,7 +20,8 @@ windows-core = "0.58"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",                  # SECURITY_ATTRIBUTES (RegCreateKeyExW, CreateMutexW)
-    "Win32_System_Com",                # IDispatch, IConnectionPoint{Container}, CoCreateInstance
+    "Win32_System_Com",                # IDispatch, IConnectionPoint{Container}, IServiceProvider, CoCreateInstance
+    "Win32_System_Ole",                # IShellBrowser, IShellView (PIDL fallback chain)
     "Win32_System_Registry",           # HKCU autostart
     "Win32_System_Threading",          # CreateMutexW for single-instance
     "Win32_System_Diagnostics_ToolHelp", # process enumeration for conflict detection
