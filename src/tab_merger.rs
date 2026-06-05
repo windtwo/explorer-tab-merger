@@ -246,10 +246,10 @@ fn parsing_path_via_pidl(wb: &IWebBrowser2) -> Option<String> {
         let folder_view: IFolderView = view.cast().ok()?;
         let persist: IPersistFolder2 = folder_view.GetFolder().ok()?;
 
-        let pidl = persist.GetCurFolder().ok()?;
+        let pidl = persist.GetCurFolder().ok()?; // *mut ITEMIDLIST (raw pointer)
         let name_result = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING);
         // Free the PIDL regardless of whether name resolution succeeded.
-        CoTaskMemFree(Some(pidl.0 as *const core::ffi::c_void));
+        CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
 
         let pwstr = name_result.ok()?;
         let s = pwstr.to_string().ok();
