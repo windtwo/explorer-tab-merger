@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetLayeredWindowAttributes, GetWindowLongPtrW, GWL_EXSTYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
+    LWA_ALPHA, WS_EX_LAYERED,
+};
 
 use crate::log;
 use crate::win_util;
@@ -113,19 +117,31 @@ pub fn uncloak_all() {
 }
 
 /// Startup recovery: if a previous run of us crashed mid-merge, Explorer windows may
-/// still be parked off-screen carrying our cloak marker property. Walk all CabinetWClass
-/// top-levels and restore any that are still marked.
+/// still be sitting around with `WS_EX_LAYERED` + alpha < 255 (invisible to the user).
+/// Walk all CabinetWClass top-levels and restore opacity on any that look cloaked.
 pub fn recover_orphans() {
     let mut restored = 0usize;
     for hwnd in win_util::find_all_explorer_windows() {
-        if win_util::is_cloaked(hwnd) {
-            win_util::uncloak(hwnd);
-            restored += 1;
+        unsafe {
+            let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if (exstyle as u32) & WS_EX_LAYERED.0 == 0 {
+                continue; // not layered → not us
+            }
+            let mut alpha: u8 = 0;
+            let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+            if GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags))
+                .is_ok()
+                && (flags.0 & LWA_ALPHA.0) != 0
+                && alpha < 255
+            {
+                win_util::uncloak(hwnd);
+                restored += 1;
+            }
         }
     }
     if restored > 0 {
         log::write(&format!(
-            "startup recovery: restored {} off-screen orphan window(s)",
+            "startup recovery: restored {} orphan-cloaked window(s)",
             restored
         ));
     }

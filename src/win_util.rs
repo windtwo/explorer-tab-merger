@@ -5,21 +5,13 @@
 //! Win32 call site.
 
 use windows::core::{Error, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetPropW, GetWindowRect,
-    PostMessageW, RemovePropW, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow,
-    GA_ROOT, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_SHOWNORMAL, WM_COMMAND,
+    EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetWindowLongPtrW, PostMessageW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WM_COMMAND, WS_EX_LAYERED,
 };
-
-const PROP_ORIG_X: &str = "ExplorerTabMerger_OrigX";
-const PROP_ORIG_Y: &str = "ExplorerTabMerger_OrigY";
-const PROP_CLOAKED: &str = "ExplorerTabMerger_Cloaked";
-
-/// Off-screen coordinate to park cloaked windows at. Far enough that no real monitor
-/// arrangement reaches it.
-const OFFSCREEN: i32 = -32_000;
 
 /// File Explorer's top-level window class.
 pub const CABINET_WCLASS: &str = "CabinetWClass";
@@ -119,87 +111,60 @@ pub fn request_new_tab(host: HWND) -> Result<(), Error> {
     Ok(())
 }
 
-/// Hide a window by moving it far off-screen with `SWP_HIDEWINDOW`, after recording its
-/// original position in window properties. This is w4po's "keep theme" hide method.
+/// Hide the window by making it a layered window with alpha=0 (fully transparent).
+/// This is the same mechanism the original w4po project uses (see Helper.HideWindow,
+/// non-keepTheme branch).
 ///
-/// Why not `WS_EX_LAYERED` + alpha=0 (what we used through v1.0.1)? Restoring a layered
-/// window to visible (uncloak) proved unreliable on Win11 for windows spawned by some
-/// sources — external apps ("Show in folder" from WeChat etc.) and virtual folders
-/// (This PC, Recycle Bin) opened while another Explorer window exists. They'd stay
-/// invisible after uncloak (present in the taskbar, blank on click). Moving off-screen
-/// and back is a pure coordinate operation that cannot leave the window stuck invisible.
+/// Why not DWM cloak? Cloak only tells the compositor "don't composite next frame", but
+/// Win11 paints the window-open animation BEFORE the compositor stage — so cloak misses
+/// the first visible frame. WS_EX_LAYERED + alpha=0 is enforced at the GDI level for
+/// every painted pixel, including animation frames, so the window is invisible from the
+/// moment the style is applied.
 pub fn cloak(hwnd: HWND) {
-    let px = HSTRING::from(PROP_ORIG_X);
-    let py = HSTRING::from(PROP_ORIG_Y);
-    let pc = HSTRING::from(PROP_CLOAKED);
     unsafe {
-        // Record the original position so uncloak can restore it.
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            let _ = SetPropW(hwnd, PCWSTR(px.as_ptr()), pack_handle(rect.left));
-            let _ = SetPropW(hwnd, PCWSTR(py.as_ptr()), pack_handle(rect.top));
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered_bit = WS_EX_LAYERED.0 as isize;
+        if exstyle & layered_bit == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle | layered_bit);
         }
-        let _ = SetPropW(hwnd, PCWSTR(pc.as_ptr()), pack_handle(1));
-
-        let _ = SetWindowPos(
-            hwnd,
-            HWND(std::ptr::null_mut()),
-            OFFSCREEN,
-            OFFSCREEN,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
-        );
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
     }
 }
 
-/// Reverse of [`cloak`]: move the window back to its recorded position and show it.
+/// Reverse of [`cloak`]. Three steps, mirroring what the original w4po project does on
+/// uncloak:
+/// 1. Restore alpha to 255 (fully opaque).
+/// 2. **Remove the `WS_EX_LAYERED` style bit.** Without this, some Win11 Explorer
+///    windows (notably those spawned by external apps — WeChat, "Show in folder", etc.)
+///    stay invisible even after alpha=255 because the layered-window rendering path
+///    keeps a stale invisible composition. Removing the style returns the window to
+///    normal rendering and forces a fresh paint.
+/// 3. `SetWindowPos(SWP_FRAMECHANGED)` to tell the compositor to re-evaluate the
+///    frame — a belt-and-braces against any leftover invisible state from step 2.
 pub fn uncloak(hwnd: HWND) {
-    let px = HSTRING::from(PROP_ORIG_X);
-    let py = HSTRING::from(PROP_ORIG_Y);
-    let pc = HSTRING::from(PROP_CLOAKED);
     unsafe {
-        let x = unpack_handle(GetPropW(hwnd, PCWSTR(px.as_ptr())));
-        let y = unpack_handle(GetPropW(hwnd, PCWSTR(py.as_ptr())));
-        let _ = RemovePropW(hwnd, PCWSTR(px.as_ptr()));
-        let _ = RemovePropW(hwnd, PCWSTR(py.as_ptr()));
-        let _ = RemovePropW(hwnd, PCWSTR(pc.as_ptr()));
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
 
-        // If we somehow lack a recorded on-screen position, fall back to a sane spot
-        // rather than leaving the window off-screen.
-        let (tx, ty) = if x <= OFFSCREEN || (x == 0 && y == 0) {
-            (120, 120)
-        } else {
-            (x, y)
-        };
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered_bit = WS_EX_LAYERED.0 as isize;
+        if exstyle & layered_bit != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle & !layered_bit);
+        }
 
         let _ = SetWindowPos(
             hwnd,
             HWND(std::ptr::null_mut()),
-            tx,
-            ty,
             0,
             0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
-        // Belt-and-braces in case the window was also minimised.
+
+        // Belt-and-braces: explicitly show the window. No-op if already visible; covers
+        // the rare case where WS_VISIBLE got cleared or the window was minimised.
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
     }
-}
-
-/// True if this window currently carries our cloak marker property (i.e., we hid it and
-/// haven't restored it yet). Used by startup recovery to find orphans from a crash.
-pub fn is_cloaked(hwnd: HWND) -> bool {
-    let pc = HSTRING::from(PROP_CLOAKED);
-    unsafe { !GetPropW(hwnd, PCWSTR(pc.as_ptr())).0.is_null() }
-}
-
-fn pack_handle(v: i32) -> HANDLE {
-    HANDLE(v as isize as *mut core::ffi::c_void)
-}
-
-fn unpack_handle(h: HANDLE) -> i32 {
-    h.0 as isize as i32
 }
 
 pub fn bring_to_foreground(hwnd: HWND) {

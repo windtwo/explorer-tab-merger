@@ -110,23 +110,6 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
         }
     };
 
-    // Read the target location BEFORE touching the host. Filesystem folders give a
-    // `file://` URL. Virtual shell folders (Recycle Bin, This PC, Control Panel,
-    // Network, ...) return an EMPTY LocationURL and cannot be navigated to via the
-    // string URL form Navigate2 accepts (a "::{CLSID}" path yields E_INVALIDARG; only
-    // a PIDL-VARIANT works, which isn't worth the extra SafeArray machinery for the
-    // marginal benefit). We don't merge virtual folders — skip cleanly here, before
-    // opening any tab in the host, so we never leave a stray blank tab behind.
-    let location = unsafe { new_wb.LocationURL() }
-        .map(|b| b.to_string())
-        .unwrap_or_default();
-    if location.is_empty() {
-        return Err(windows::core::Error::new(
-            E_FAIL,
-            "[skip] virtual shell folder — not merged",
-        ));
-    }
-
     // Snapshot host's IShellWindows entry count BEFORE we trigger a new tab; we'll wait
     // for it to grow by one and then take the newest matching entry.
     let host_entry_count_before = count_entries_for_top(shell_windows, host);
@@ -141,6 +124,10 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
             "[wait_new_tab] timeout waiting for new ShellTabWindowClass child",
         ));
     }
+
+    // Read URL before we destroy the original window.
+    let location_bstr: BSTR =
+        unsafe { new_wb.LocationURL() }.map_err(|e| ctx(e, "LocationURL"))?;
 
     // Wait for the new IShellWindows entry. In Win11 each tab IS its own entry, but they
     // all report the same top-level HWND, so we can't distinguish by HWND — we rely on
@@ -167,7 +154,7 @@ fn try_merge(shell_windows: &IShellWindows, new_top: HWND, host: HWND) -> WinRes
     // Optional VARIANT params: COM here needs non-null pointers to VT_EMPTY VARIANTs,
     // not real NULL. Passing None errors with RPC_X_NULL_REF_POINTER (0x800706F4).
     unsafe {
-        let url_var = VARIANT::from(BSTR::from(location.as_str()));
+        let url_var = VARIANT::from(location_bstr);
         let empty = VARIANT::default();
         nav_wb
             .Navigate2(
